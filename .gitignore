@@ -13,6 +13,11 @@ venv/
 .mypy_cache/
 .ruff_cache/
 
+# Go 构建产物（源码保留；镜像在容器内编译）
+go/seat
+go/mockasr
+go/bin/
+
 # 运行数据（会话转写记录）
 sessions/
 

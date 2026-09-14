@@ -1,0 +1,76 @@
+# AI 跨学科实时翻译席 —— 容器镜像
+#
+# 构建：
+#   docker build -t translation-seat:latest .
+#
+# 运行（推荐挂载 .env 与 sessions，配置密钥不进镜像）：
+#   docker run -d --name translation-seat \
+#     -p 8081:8081 \
+#     -v "$PWD/.env:/app/.env:ro" \
+#     -v "$PWD/sessions:/app/sessions" \
+#     translation-seat:latest
+#
+# 访问：控制台 http://<host>:8081/console ，投屏 http://<host>:8081/screen
+#
+# 说明：
+#   - 容器内一般无音频设备，程序会自动降级为「浏览器收音」（控制台勾选后点「开始收音」）。
+#     若需容器直连声卡，加 --device /dev/snd 并保证宿主机音频权限。
+#   - 远端浏览器访问 HTTP 属非安全上下文，麦克风需 HTTPS 或 localhost；
+#     生产建议前置网关做 TLS 终结（已开启 --proxy-headers）。
+
+# ---------- 构建阶段：编译带 C 扩展的依赖（webrtcvad 无 wheel，需 gcc）----------
+FROM python:3.12-slim AS builder
+
+ENV PIP_INDEX_URL=https://mirrors.tencent.com/pypi/simple/ \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc g++ python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python -m venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH
+
+# setuptools<81：webrtcvad 的 sdist 走 legacy setup.py，依赖 setuptools 的 distutils 兼容层
+COPY requirements.txt .
+RUN pip install "setuptools<81" wheel \
+    && pip install -r requirements.txt
+
+# ---------- 运行阶段 ----------
+FROM python:3.12-slim
+
+ENV TZ=Asia/Shanghai \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH=/opt/venv/bin:$PATH \
+    HOST=0.0.0.0 \
+    PORT=8081
+
+# ca-certificates：访问 ASR/LLM 的 HTTPS 端点
+# libportaudio2：sounddevice 运行时依赖（缺省时本机采集失败会自动降级为浏览器收音）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates libportaudio2 tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /opt/venv /opt/venv
+
+COPY app ./app
+COPY tools ./tools
+COPY hotwords_dict.txt ./
+COPY .env.example ./
+
+RUN mkdir -p /app/sessions
+VOLUME ["/app/sessions"]
+
+EXPOSE 8081
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD python -c "import os,urllib.request,sys;u='http://127.0.0.1:'+os.environ.get('PORT','8081')+'/api/health';sys.exit(0 if urllib.request.urlopen(u,timeout=3).status==200 else 1)"
+
+# 生产启动不带 --reload（run.sh 的 --reload 仅用于本地开发）
+CMD ["sh", "-c", "exec uvicorn app.main:app --host \"${HOST:-0.0.0.0}\" --port \"${PORT:-8081}\" --proxy-headers --forwarded-allow-ips \"*\""]

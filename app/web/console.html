@@ -122,6 +122,11 @@
 </footer>
 <script>
 const $=id=>document.getElementById(id);
+// 部署可能挂在路径前缀下（如腾讯云 Kong 网关的 base path /conf）。
+// 页面固定是 <前缀>/console 或 <前缀>/screen，从 pathname 反推前缀 —— 根路径部署时为空串。
+// 所有接口/WS 调用都必须带上它：绝对路径 /api/x 在 /conf/console 页面里会被浏览器
+// 解析成 /api/x（前缀丢失），即使 Kong 配了 strip_path 也回不到后端。
+const BASE=location.pathname.replace(/\/(console|screen)\/?$/,"").replace(/\/+$/,"");
 let ws, sid=null, curInv=null, curTask=null, curText="", callCount=0;
 // 未捕获异常不再静默：底部横幅提示（元素缺失/接口报错都会立刻可见）
 window.onerror=(msg,src,line)=>{ const b=$("errBar"); if(b){ b.style.display=""; b.textContent="页面脚本错误："+msg+"（第 "+line+" 行）— 请截图反馈"; } return false; };
@@ -129,7 +134,7 @@ window.onerror=(msg,src,line)=>{ const b=$("errBar"); if(b){ b.style.display="";
 function connect(){
   // 协议自适应：页面走 https 时必须用 wss，否则浏览器直接拒绝连接（前置 TLS 网关时踩）
   const scheme=location.protocol==="https:"?"wss://":"ws://";
-  ws=new WebSocket(scheme+location.host+"/ws/console");
+  ws=new WebSocket(scheme+location.host+BASE+"/ws/console");
   ws.onopen=()=>console.log("ws open");
   ws.onmessage=e=>{ const m=JSON.parse(e.data); handle(m); };
   ws.onclose=()=>setTimeout(connect,1000);
@@ -137,7 +142,7 @@ function connect(){
 // 立即建连：函数声明已提升，handle 等在收到消息时（下一个事件循环）才被调用，此时脚本早已执行完。
 // 放在这里而不是脚本末尾 —— 后面任何一处事件绑定抛错都不该连带掐断转写通道。
 connect();
-function post(path,body){ return fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:body?JSON.stringify(body):"{}"}).then(r=>r.json()); }
+function post(path,body){ return fetch(BASE+path,{method:"POST",headers:{"Content-Type":"application/json"},body:body?JSON.stringify(body):"{}"}).then(r=>r.json()); }
 
 function handle(m){
   switch(m.type){
@@ -203,7 +208,7 @@ function finalSeg(id,text){
   // 已确认终稿（黑色），每条独立，可点击修正
   let el=document.getElementById("seg-"+id);
   if(!el){ el=document.createElement("div"); el.className="seg final"; el.id="seg-"+id; el.contentEditable="true";
-    el.addEventListener("blur",()=>{ if(el.dataset.text!==el.innerText){ fetch(`/api/segment/${id}`,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:el.innerText})}); el.dataset.text=el.innerText; }});
+    el.addEventListener("blur",()=>{ if(el.dataset.text!==el.innerText){ fetch(`${BASE}/api/segment/${id}`,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:el.innerText})}); el.dataset.text=el.innerText; }});
     $("transcript").appendChild(el); }
   el.dataset.text=text; el.textContent=text;
   // 终稿确认后清空草稿行
@@ -280,7 +285,7 @@ $("aiCard").addEventListener("blur",()=>{
   const el=$("aiCard"), t=el.innerText.trim();
   if(curInv && t && el.dataset.text!==undefined && t!==el.dataset.text){
     el.dataset.text=t; curText=t;
-    fetch(`/api/invocation/${curInv}`,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:t})});
+    fetch(`${BASE}/api/invocation/${curInv}`,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:t})});
   }
 });
 // 快捷键
@@ -294,7 +299,7 @@ addEventListener("keydown",e=>{
   else if(e.key==="Escape") $("btnKill").click();
 });
 // 健康检查（ASR 状态来自流水线真实连接）
-setInterval(async()=>{ try{ const h=await fetch("/api/health").then(r=>r.json());
+setInterval(async()=>{ try{ const h=await fetch(BASE+"/api/health").then(r=>r.json());
   const a=h.asr;
   if(a==="connected"){ $("asrDot").className="dot ok"; $("asrStatus").textContent="ASR: 已连接"+(h.asr_idle_sec>15?(" · 无语音 "+Math.round(h.asr_idle_sec)+"s"):""); }
   else if(a==="connecting"){ $("asrDot").className="dot warn"; $("asrStatus").textContent="ASR: 连接失败，重连中"+(h.asr_detail?" · "+h.asr_detail:""); }
@@ -337,7 +342,7 @@ async function startMic(){
   try{ micCtx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:16000}); }
   catch(e){ micCtx=new (window.AudioContext||window.webkitAudioContext)(); }
   const src=micCtx.createMediaStreamSource(micStream);
-  micWs=new WebSocket((location.protocol==="https:"?"wss://":"ws://")+location.host+"/ws/audio");
+  micWs=new WebSocket((location.protocol==="https:"?"wss://":"ws://")+location.host+BASE+"/ws/audio");
   micWs.onclose=ev=>{ if(micOn){ if(ev.code===4001) $("sessionInfo").textContent="服务器流水线未开启浏览器收音：请勾选「浏览器收音」后重新点「开始 Session」"; stopMic(); } };
   const rate=micCtx.sampleRate;
   micProc=micCtx.createScriptProcessor(2048,1,1);
@@ -370,7 +375,7 @@ function stopMic(){
 $("btnMicStop").onclick=stopMic;
 // ---- 热词面板：查看/手动编辑/按人生成/参与开关 ----
 async function loadHotwords(){
-  try{ const h=await fetch("/api/hotwords").then(r=>r.json());
+  try{ const h=await fetch(BASE+"/api/hotwords").then(r=>r.json());
     if(document.activeElement!==$("hwText")) $("hwText").value=Object.keys(h.words||{}).join("\n");
     $("hwEnabled").checked=h.enabled!==false;
   }catch(e){}
@@ -384,7 +389,7 @@ $("docUpload").onclick=async()=>{
   $("hwStatus").textContent="解析中…";
   $("sessionInfo").textContent="正在解析 "+f.name+"（解析+抽取通常 1~2 分钟）…";
   try{
-    const r=await fetch("/api/materials/upload",{method:"POST",body:fd}).then(r=>r.json());
+    const r=await fetch(BASE+"/api/materials/upload",{method:"POST",body:fd}).then(r=>r.json());
     if(r&&r.error){
       $("hwStatus").textContent="失败："+r.error;
       $("sessionInfo").textContent="讲稿解析失败："+r.error;
@@ -402,7 +407,7 @@ $("docUpload").onclick=async()=>{
   }
 };
 $("hwSave").onclick=async()=>{
-  const r=await fetch("/api/hotwords",{method:"PUT",headers:{"Content-Type":"application/json"},
+  const r=await fetch(BASE+"/api/hotwords",{method:"PUT",headers:{"Content-Type":"application/json"},
     body:JSON.stringify({text:$("hwText").value})}).then(r=>r.json()).catch(()=>null);
   $("hwStatus").textContent=r&&r.ok?("已保存 "+r.count+" 个热词，ASR 即时生效"):"保存失败";
 };
@@ -416,7 +421,7 @@ $("hwEnabled").onchange=async()=>{
 const DISCIPLINE_DEFAULT="白话";
 async function loadTargetDiscipline(){
   const td=$("targetDiscipline"); if(!td) return;
-  try{ const r=await fetch("/api/target-discipline").then(r=>r.json());
+  try{ const r=await fetch(BASE+"/api/target-discipline").then(r=>r.json());
     const v=(r&&r.discipline)||"";
     if(document.activeElement!==td) td.value=(v===DISCIPLINE_DEFAULT)?"":v;
   }catch(e){}

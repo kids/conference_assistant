@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -285,8 +285,12 @@ app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
 
 # ===================== 页面 =====================
 @app.get("/")
-async def root():
-    return RedirectResponse("/console")
+async def root(request: Request):
+    # 挂在路径前缀下时（Kong base path + strip_path），后端看到的是去掉前缀的路径，
+    # 此时直接跳 /console 会让浏览器丢掉前缀、落到网关的其它路由上。
+    # 前缀由网关通过 X-Forwarded-Prefix 告知（未配则为空，行为不变）。
+    prefix = (request.headers.get("x-forwarded-prefix") or "").rstrip("/")
+    return RedirectResponse(prefix + "/console")
 
 
 @app.get("/console")

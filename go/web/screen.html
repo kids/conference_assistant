@@ -49,11 +49,15 @@
 <div id="subtitleArea"></div>
 <script>
 const $=id=>document.getElementById(id);
+// 部署可能挂在路径前缀下（如腾讯云 Kong 网关的 base path /conf）。
+// 页面固定是 <前缀>/screen，从 pathname 反推前缀 —— 根路径部署时为空串。
+const BASE=location.pathname.replace(/\/(console|screen)\/?$/,"").replace(/\/+$/,"");
 let ws, start=Date.now(), aiTimer=null, lastState="IDLE";
 const TASK_LABEL={TERM:"术语翻译",Q_TRANSLATE:"问题转译",A_TRANSLATE:"回答转译",BRIDGE:"桥接提问",SUMMARY:"报告总结"};
 
 function connect(){
-  ws=new WebSocket(`ws://${location.host}/ws/screen`);
+  // 协议自适应（页面走 https 时必须 wss）+ 带上路径前缀
+  ws=new WebSocket((location.protocol==="https:"?"wss://":"ws://")+location.host+BASE+"/ws/screen");
   ws.onmessage=e=>handle(JSON.parse(e.data));
   ws.onclose=()=>setTimeout(connect,1000);
 }

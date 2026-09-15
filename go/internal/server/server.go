@@ -4,6 +4,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -55,7 +56,11 @@ func (s *Server) routes() *http.ServeMux {
 
 	// ---- 页面 ----
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "/console", http.StatusFound)
+		// 挂在路径前缀下时（Kong base path + strip_path），后端看到的是去掉前缀的路径，
+		// 此时直接跳 /console 会让浏览器丢掉前缀、落到网关的其它路由上。
+		// 前缀由网关通过 X-Forwarded-Prefix 告知（腾讯云 Kong 可配；未配则为空，行为不变）。
+		prefix := strings.TrimRight(r.Header.Get("X-Forwarded-Prefix"), "/")
+		http.Redirect(w, r, prefix+"/console", http.StatusFound)
 	})
 	mux.HandleFunc("GET /console", s.servePage("console.html"))
 	mux.HandleFunc("GET /screen", s.servePage("screen.html"))

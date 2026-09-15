@@ -15,6 +15,20 @@ from app.providers.llm_openai import LlmError, OpenAICompatClient
 from app.state import display
 
 
+PLAIN_LANGUAGE = "白话"
+
+
+def _target_discipline_block(d: str) -> str:
+    """生成「翻译目标学科」约束块。
+
+    与 session.discipline（报告人学科）不同 —— 这里指的是「把内容翻译成给谁看」。
+    """
+    d = (d or "").strip() or PLAIN_LANGUAGE
+    if d == PLAIN_LANGUAGE:
+        return "【翻译目标学科】白话 —— 用非专业听众也能听懂的日常语言表达，避免堆砌专业术语。"
+    return f"【翻译目标学科】{d} —— 请把输出调整到该学科的研究者能直接理解、能据此提问的表达层次。"
+
+
 def _mock_output(task_key: str, target: str | None) -> str:
     """LLM 未配置时的占位输出，便于本地联调前端链路。"""
     if task_key == "TERM":
@@ -40,11 +54,15 @@ class AgentRunner:
             )
 
     def generate(self, sid: str, task_key: str, target: str | None = None,
-                 focus_segs: list[dict] | None = None) -> str:
-        """同步生成，返回 invocation_id；内部发布 AI_STATE/AI_DELTA/AI_READY 事件。"""
+                 focus_segs: list[dict] | None = None,
+                 target_discipline: str = PLAIN_LANGUAGE) -> str:
+        """同步生成，返回 invocation_id；内部发布 AI_STATE/AI_DELTA/AI_READY 事件。
+
+        target_discipline：把输出调整到该学科的表达层次（空值按「白话」处理）。
+        """
         task = TASKS[task_key]
         ctx = self.context.build(sid, task_key, target, focus_segs)
-        messages = self._build_messages(task, target, ctx)
+        messages = self._build_messages(task, target, ctx, target_discipline)
         prompt_hash = hashlib.md5(json.dumps(messages, ensure_ascii=False).encode()).hexdigest()[:8]
 
         iid = f"iv{int(time.time() * 1000) % 1000000:06d}"
@@ -121,7 +139,8 @@ class AgentRunner:
         )
         return iid
 
-    def _build_messages(self, task, target: str | None, ctx: dict) -> list[dict]:
+    def _build_messages(self, task, target: str | None, ctx: dict,
+                        target_discipline: str = PLAIN_LANGUAGE) -> list[dict]:
         user_parts = [
             "【会议材料（摘要/PPT/术语表）】\n" + (ctx["static"] or "（无）"),
             "【最近 30 分钟转写】\n" + (ctx["recent"] or "（无）"),
@@ -132,6 +151,7 @@ class AgentRunner:
             user_parts.append("【本场已展示过的 AI 输出（避免重复）】\n" + ctx["history"])
         if target:
             user_parts.append(f"【{task.target_hint or '目标'}】\n{target}")
+        user_parts.append(_target_discipline_block(target_discipline))
         user_parts.append("【任务】\n" + task.instruction)
         user = "\n\n".join(user_parts)
         return [

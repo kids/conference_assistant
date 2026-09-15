@@ -3,6 +3,7 @@ package contextx
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
@@ -94,6 +95,12 @@ func BuildSpeakerProfile(ctx context.Context, client *llm.Client, name, institut
 			}
 			out.Hotwords[w] = weight
 		}
+	}
+	// 空结果必须报错：LLM 偶发返回空/非 JSON 正文时，静默返回空 profile 会让
+	// 调用方显示「成功但 0 个热词」，极难排查。
+	if out.Profile == "" && len(out.Hotwords) == 0 {
+		return nil, fmt.Errorf("LLM 未返回有效内容（原始输出 %d 字）: %s",
+			len([]rune(raw)), clip(raw, 200))
 	}
 	return out, nil
 }

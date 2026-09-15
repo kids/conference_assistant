@@ -53,13 +53,15 @@
 </style>
 </head>
 <body>
+<!-- 脚本异常兜底：任何未捕获的 JS 错误都在页面底部显示，避免「点了没反应」却无从定位 -->
+<div id="errBar" style="display:none;position:fixed;left:0;right:0;bottom:0;z-index:99;background:#5a1d1d;color:#ffd7d7;font-size:12px;padding:6px 12px;border-top:1px solid #f85149"></div>
 <header>
   <h1>AI 跨学科实时翻译席 · 控制台</h1>
   <input type="text" id="speaker" placeholder="科学家姓名" style="width:120px">
   <input type="text" id="institution" placeholder="机构（可选）" style="width:150px">
-  <label class="capcheck" title="浏览器采音推送到服务器识别，适合远端打开服务（服务器无需本地麦克风）"><input type="checkbox" id="capBrowser">浏览器收音</label>
+  <label class="capcheck" title="勾选＝用浏览器麦克风采音，经 WebSocket 推给服务器识别（远端/服务器无声卡时用）；不勾选＝用服务器本机声卡。改动在下次点「开始 Session」时生效。"><input type="checkbox" id="capBrowser" checked>浏览器收音</label>
   <button id="btnSession" class="primary">开始 Session</button>
-  <button id="btnMic" title="浏览器麦克风采集，音频经 WebSocket 推送到服务器识别">开始收音</button>
+  <button id="btnMicStop" class="danger" style="display:none" title="关闭浏览器麦克风采集（服务端流水线继续运行，可用「开始 Session」重新开启）">停止收音</button>
   <button id="btnKill" class="danger">急停 (Esc)</button>
   <span class="sp"></span>
   <span><span class="dot" id="asrDot"></span> ASR</span>
@@ -81,6 +83,7 @@
         <button class="task" data-task="BRIDGE">4 桥接提问<small>跨学科连接</small></button>
         <button class="task" data-task="SUMMARY">5 报告总结<small>通俗总结</small></button>
       </div>
+      <input type="text" id="targetDiscipline" placeholder="目标学科（默认「白话」，即讲给非专业听众）" title="把 AI 输出翻译到该学科的表达层次：可直接输入自定义学科，回车或失焦生效；留空按「白话」处理。与「报告人学科」不同，这里指的是「讲给谁听」。">
       <input type="text" id="target" placeholder="目标术语/问题（可选）">
       <h2 style="padding:6px 0 8px;border:none">候选术语（点击即解释）</h2>
       <div id="terms"></div>
@@ -97,10 +100,9 @@
         <button id="btnRegen">重生成 (R)</button>
       </div>
       <h2 style="padding:12px 0 6px;border:none">热词 <label class="capcheck" style="margin-left:8px" title="关闭后 ASR 调用不携带任何热词"><input type="checkbox" id="hwEnabled" checked>参与 ASR 识别</label></h2>
-      <div style="display:flex;gap:6px;margin-bottom:6px">
-        <input type="text" id="hwName" placeholder="科学家姓名" style="flex:1;min-width:0">
-        <input type="text" id="hwInst" placeholder="机构（可选）" style="flex:1;min-width:0">
-        <button id="hwGen" title="按人名/机构检索研究背景，自动生成专属热词">按人生成</button>
+      <div style="display:flex;gap:6px;margin-bottom:6px;align-items:center">
+        <input type="file" id="docFile" accept=".pptx,.ppt,.pdf,.docx,.doc,.md,.txt,.rtf" title="支持 PPT / PDF / Word / Markdown 等。上传后自动解析正文 → 抽取热词 → 生成 AI 翻译用的背景摘要。" style="flex:1;min-width:0;font-size:12px;color:var(--dim)">
+        <button id="docUpload" title="上传演示稿：解析正文 → 抽取热词（即时用于 ASR）+ 生成浓缩摘要（作为每次 AI 调用的背景）">解析讲稿</button>
       </div>
       <textarea id="hwText" rows="5" placeholder="每行一个热词，可附权重（词 60 或 词,60）；保存后即时生效" style="width:100%;background:#14161a;border:1px solid var(--line);border-radius:6px;color:var(--txt);padding:8px;font-size:13px;font-family:inherit;line-height:1.5;resize:vertical"></textarea>
       <div style="display:flex;gap:8px;align-items:center;margin-top:6px">
@@ -121,13 +123,20 @@
 <script>
 const $=id=>document.getElementById(id);
 let ws, sid=null, curInv=null, curTask=null, curText="", callCount=0;
+// 未捕获异常不再静默：底部横幅提示（元素缺失/接口报错都会立刻可见）
+window.onerror=(msg,src,line)=>{ const b=$("errBar"); if(b){ b.style.display=""; b.textContent="页面脚本错误："+msg+"（第 "+line+" 行）— 请截图反馈"; } return false; };
 
 function connect(){
-  ws=new WebSocket(`ws://${location.host}/ws/console`);
+  // 协议自适应：页面走 https 时必须用 wss，否则浏览器直接拒绝连接（前置 TLS 网关时踩）
+  const scheme=location.protocol==="https:"?"wss://":"ws://";
+  ws=new WebSocket(scheme+location.host+"/ws/console");
   ws.onopen=()=>console.log("ws open");
   ws.onmessage=e=>{ const m=JSON.parse(e.data); handle(m); };
   ws.onclose=()=>setTimeout(connect,1000);
 }
+// 立即建连：函数声明已提升，handle 等在收到消息时（下一个事件循环）才被调用，此时脚本早已执行完。
+// 放在这里而不是脚本末尾 —— 后面任何一处事件绑定抛错都不该连带掐断转写通道。
+connect();
 function post(path,body){ return fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:body?JSON.stringify(body):"{}"}).then(r=>r.json()); }
 
 function handle(m){
@@ -153,7 +162,12 @@ function handle(m){
       $("checks").textContent="字数="+m.chars+" 约"+m.est_sec+"s | "+JSON.stringify(m.checks);
       break;
     case "AI_SHOWING": $("stateLabel").textContent="SHOWING"; break;
-    case "AI_KILLED": $("stateLabel").textContent="IDLE"; $("aiCard").innerHTML="<span class='state'>已急停</span>"; $("aiCard").contentEditable="false"; break;
+    case "AI_KILLED":
+      $("stateLabel").textContent="IDLE"; $("aiCard").innerHTML="<span class='state'>已急停</span>"; $("aiCard").contentEditable="false";
+      // 同上：急停后卡片是状态占位文本，清掉 curInv 防止误投屏；
+      // 想继续用直接按任务键，想重生成按 R（curTask 仍保留）
+      curInv=null; curText="";
+      break;
     case "ASR_STATUS":
       $("asrStatus").textContent="ASR:"+m.status;
       $("asrDot").className="dot "+(m.status==="connected"||m.status.startsWith("event:")?"ok":"warn");
@@ -218,21 +232,41 @@ async function invoke(task,target){
   await post("/api/invoke",{task,target:target||$("target").value||null});
 }
 async function startSession(){
-  const speaker=$("speaker").value.trim();
-  const institution=$("institution").value.trim();
-  const capture=$("capBrowser").checked?"browser":"mic";
+  // 元素缺失一律降级为默认值：任何一处取不到都不能让整个启动流程中断（否则会永久停在「启动中…」）
+  const el=id=>$(id);
+  const speaker=el("speaker")?el("speaker").value.trim():"";
+  const institution=el("institution")?el("institution").value.trim():"";
+  // 「浏览器收音」开关决定音源：勾选＝浏览器采音；不勾选＝服务器本机声卡
+  const capture=(el("capBrowser")&&el("capBrowser").checked)?"browser":"mic";
+  const td=el("targetDiscipline");
+  const targetDiscipline=(td&&td.value.trim())?td.value.trim():"白话";
   $("sessionInfo").textContent="启动中…";
-  const r=await post("/api/session",{title:"Workshop",speaker,institution,discipline:"",ai_enabled:true,capture});
-  if(!r.pipeline||!r.pipeline.ok){ alert("音频采集失败："+(r.pipeline&&r.pipeline.msg)); return; }
-  let info=(speaker?speaker+" · ":"")+r.session_id;
-  if(r.pipeline.capture==="browser"){
-    info+=" · 浏览器收音模式，请点「开始收音」授权麦克风";
-  }else if(r.pipeline.note){
-    info+=" · "+r.pipeline.note;
-  }else{
-    info+=(speaker?" · 转写已开始，热词后台生成中…":" · 使用全局热词");
+  try{
+    const r=await post("/api/session",{title:"Workshop",speaker,institution,discipline:"",target_discipline:targetDiscipline,ai_enabled:true,capture});
+    if(!r.pipeline||!r.pipeline.ok){
+      $("sessionInfo").textContent="启动失败："+((r.pipeline&&r.pipeline.msg)||"服务端未返回流水线信息");
+      alert("音频采集失败："+(r.pipeline&&r.pipeline.msg));
+      return;
+    }
+    sid=r.session_id;   // 直接取响应里的 id，不等 WS 的 SESSION 事件（否则自动开麦时 sid 可能还是空）
+    let info=(speaker?speaker+" · ":"")+r.session_id;
+    // 以服务端**实际生效**的音源为准：本机声卡打开失败时服务端会自动降级为 browser，
+    // 这时也必须把浏览器麦克风打开，否则没有音频进来。
+    if(r.pipeline.capture==="browser"){
+      info+=" · 浏览器收音";
+      const ok=await startMic();
+      info+=ok?"（麦克风已开启）":"（麦克风未开启，见下方提示）";
+    }else{
+      info+=" · 服务器本机麦克风";
+      if(speaker) info+=" · 热词后台生成中…";
+    }
+    if(r.pipeline.note) info+=" · "+r.pipeline.note;
+    $("sessionInfo").textContent=info;
+  }catch(e){
+    // 网络失败 / 返回非 JSON / 服务端 500：必须给出可见反馈，不能停在「启动中…」
+    $("sessionInfo").textContent="启动失败："+e.message+"（服务端是否已启动？看日志）";
+    console.error("startSession failed",e);
   }
-  $("sessionInfo").textContent=info;
 }
 // 事件绑定
 document.querySelectorAll(".task").forEach(b=>b.onclick=()=>invoke(b.dataset.task));
@@ -286,20 +320,25 @@ function downsample(buf,inRate,outRate){
   }
   return out;
 }
-async function toggleMic(){
-  if(micOn){ stopMic(); return; }
-  if(!sid){ alert("请先开始 Session（远端收音请同时勾选「浏览器收音」）"); return; }
+// 由「开始 Session」自动调用（不再单独设按钮）。返回是否成功开启。
+async function startMic(){
+  if(micOn) return true;   // 已在采集：直接复用，避免开出第二条流把音频推重
   if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
-    alert("当前环境无法访问麦克风：远端 HTTP 属非安全上下文。\n请用 localhost 或 HTTPS 访问，或在浏览器将本地址设为可信（Chrome: chrome://flags/#unsafely-treat-insecure-origin-as-secure 添加地址后重启）");
-    return;
+    $("micStatus").textContent="收音: 浏览器不支持麦克风";
+    $("sessionInfo").textContent="浏览器收音失败：非安全上下文，无法访问麦克风。请用 http://127.0.0.1:<端口> 访问（SSH 端口转发即可），或在 Chrome 把本地址设为可信（chrome://flags/#unsafely-treat-insecure-origin-as-secure）；也可取消勾选「浏览器收音」改用服务器声卡";
+    return false;
   }
   try{ micStream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false}); }
-  catch(e){ alert("麦克风授权失败："+e.message); return; }
+  catch(e){
+    $("micStatus").textContent="收音: 麦克风授权失败";
+    $("sessionInfo").textContent="浏览器收音失败："+e.message+"（可在地址栏左侧重新允许麦克风，或取消勾选「浏览器收音」改用服务器声卡）";
+    return false;
+  }
   try{ micCtx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:16000}); }
   catch(e){ micCtx=new (window.AudioContext||window.webkitAudioContext)(); }
   const src=micCtx.createMediaStreamSource(micStream);
   micWs=new WebSocket((location.protocol==="https:"?"wss://":"ws://")+location.host+"/ws/audio");
-  micWs.onclose=ev=>{ if(micOn){ if(ev.code===4001) alert("服务器流水线未开启浏览器收音：请在控制台勾选「浏览器收音」后重新点「开始 Session」"); stopMic(); } };
+  micWs.onclose=ev=>{ if(micOn){ if(ev.code===4001) $("sessionInfo").textContent="服务器流水线未开启浏览器收音：请勾选「浏览器收音」后重新点「开始 Session」"; stopMic(); } };
   const rate=micCtx.sampleRate;
   micProc=micCtx.createScriptProcessor(2048,1,1);
   micProc.onaudioprocess=ev=>{
@@ -314,8 +353,9 @@ async function toggleMic(){
   const mute=micCtx.createGain(); mute.gain.value=0;  // ScriptProcessor 需连 destination 才运转；增益置 0 防外放回声
   micProc.connect(mute); mute.connect(micCtx.destination);
   micOn=true;
-  $("btnMic").textContent="停止收音"; $("btnMic").classList.add("danger");
+  $("btnMicStop").style.display="";   // 采集期间才显示「停止收音」
   $("micStatus").textContent="收音: 采集中（浏览器）";
+  return true;
 }
 function stopMic(){
   micOn=false;
@@ -324,10 +364,10 @@ function stopMic(){
   try{ if(micCtx) micCtx.close(); }catch(e){}
   try{ if(micWs&&micWs.readyState===1) micWs.close(); }catch(e){}
   micStream=null; micProc=null; micCtx=null; micWs=null;
-  $("btnMic").textContent="开始收音"; $("btnMic").classList.remove("danger");
+  $("btnMicStop").style.display="none";
   $("micStatus").textContent="收音: 已停止";
 }
-$("btnMic").onclick=toggleMic;
+$("btnMicStop").onclick=stopMic;
 // ---- 热词面板：查看/手动编辑/按人生成/参与开关 ----
 async function loadHotwords(){
   try{ const h=await fetch("/api/hotwords").then(r=>r.json());
@@ -335,12 +375,31 @@ async function loadHotwords(){
     $("hwEnabled").checked=h.enabled!==false;
   }catch(e){}
 }
-$("hwGen").onclick=async()=>{
-  const name=$("hwName").value.trim();
-  if(!name){ alert("请填写科学家姓名"); return; }
-  $("hwStatus").textContent="生成中…";
-  const r=await post("/api/hotwords/generate",{name,institution:$("hwInst").value.trim(),discipline:""});
-  if(r&&r.error){ $("hwStatus").textContent="生成失败："+r.error; }
+// ---- 上传讲稿：服务端解析正文 → 抽热词（即时用于 ASR）+ 生成浓缩摘要（AI 背景）----
+$("docUpload").onclick=async()=>{
+  const f=$("docFile").files[0];
+  if(!f){ alert("请先选择演示稿文件"); return; }
+  if(!sid){ alert("请先点「开始 Session」再上传讲稿"); return; }
+  const fd=new FormData(); fd.append("file",f);
+  $("hwStatus").textContent="解析中…";
+  $("sessionInfo").textContent="正在解析 "+f.name+"（解析+抽取通常 1~2 分钟）…";
+  try{
+    const r=await fetch("/api/materials/upload",{method:"POST",body:fd}).then(r=>r.json());
+    if(r&&r.error){
+      $("hwStatus").textContent="失败："+r.error;
+      $("sessionInfo").textContent="讲稿解析失败："+r.error;
+      return;
+    }
+    $("hwStatus").textContent="已抽 "+r.hotwords+" 个热词（新增 "+r.hotwords_new+"），摘要 "+r.digest_chars+" 字";
+    $("sessionInfo").textContent=f.name+" 解析完成 · 正文 "+r.parsed_chars+" 字"
+      +(r.truncated?"（超长已截断）":"")
+      +" · 摘要 "+r.digest_chars+" 字已作为 AI 翻译背景"
+      +(r.fields&&r.fields.length?(" · 方向："+r.fields.join("／")):"");
+    loadHotwords();
+  }catch(e){
+    $("hwStatus").textContent="失败："+e.message;
+    $("sessionInfo").textContent="讲稿上传失败："+e.message;
+  }
 };
 $("hwSave").onclick=async()=>{
   const r=await fetch("/api/hotwords",{method:"PUT",headers:{"Content-Type":"application/json"},
@@ -351,8 +410,33 @@ $("hwEnabled").onchange=async()=>{
   const r=await post("/api/hotwords/toggle",{enabled:$("hwEnabled").checked});
   $("hwStatus").textContent=$("hwEnabled").checked?"热词已参与 ASR 调用":"热词已停用（ASR 不带热词）";
 };
-loadHotwords();
-connect();
+// ---- 目标学科：把 AI 输出翻译到该学科的表达层次（可输入下拉框，默认「白话」）----
+// 目标学科：默认「白话」。默认值不预填进输入框 —— 由 placeholder 表达即可，
+// 否则一进页面就看到框里写着「白话」，像已经选定了什么，反而突兀。
+const DISCIPLINE_DEFAULT="白话";
+async function loadTargetDiscipline(){
+  const td=$("targetDiscipline"); if(!td) return;
+  try{ const r=await fetch("/api/target-discipline").then(r=>r.json());
+    const v=(r&&r.discipline)||"";
+    if(document.activeElement!==td) td.value=(v===DISCIPLINE_DEFAULT)?"":v;
+  }catch(e){}
+}
+async function applyTargetDiscipline(){
+  const td=$("targetDiscipline"); if(!td) return;
+  const v=td.value.trim()||DISCIPLINE_DEFAULT;
+  td.value=(v===DISCIPLINE_DEFAULT)?"":v;   // 回到默认就清空，交回 placeholder
+  const r=await post("/api/target-discipline",{discipline:v}).catch(()=>null);
+  $("sessionInfo").textContent=(r&&r.ok)?("目标学科："+r.discipline):"目标学科切换失败";
+}
+// 元素存在才绑定。将来若再漏加元素，最坏只丢这一个功能，不会连累后面的初始化（这正是上次
+// 「卡在启动中」的成因：一行 null.onchange 抛错，把 connect() 一起带走了）
+if($("targetDiscipline")){
+  $("targetDiscipline").onchange=applyTargetDiscipline;
+  $("targetDiscipline").addEventListener("keydown",e=>{ if(e.key==="Enter"){ e.preventDefault(); applyTargetDiscipline(); } });
+}
+// 初始化：WS 已在文件开头建立；其余各自隔离，任一失败不影响其它
+try{ loadHotwords(); }catch(e){ console.error(e); }
+try{ loadTargetDiscipline(); }catch(e){ console.error(e); }
 </script>
 </body>
 </html>

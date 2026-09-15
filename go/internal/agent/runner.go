@@ -39,13 +39,15 @@ func NewRunner(s *config.Settings, ctx *contextx.Manager, st *store.Store,
 }
 
 // Generate 同步生成，返回 invocation_id；内部发布 AI_STATE/AI_DELTA/AI_READY 事件。
-func (r *Runner) Generate(ctx context.Context, sid, taskKey, target string, focusSegs []store.Segment) (string, error) {
+// targetDiscipline：把输出调整到该学科的表达层次（空值按「白话」处理）。
+func (r *Runner) Generate(ctx context.Context, sid, taskKey, target string,
+	focusSegs []store.Segment, targetDiscipline string) (string, error) {
 	task, ok := Tasks[taskKey]
 	if !ok {
 		return "", fmt.Errorf("未知任务: %s", taskKey)
 	}
 	ctxData := r.Context.Build(sid, focusSegs)
-	messages := buildMessages(task, target, ctxData)
+	messages := buildMessages(task, target, ctxData, targetDiscipline)
 	promptHash := hashPrompt(messages)
 
 	iid := fmt.Sprintf("iv%06d", time.Now().UnixMilli()%1000000)
@@ -138,7 +140,23 @@ func (r *Runner) Generate(ctx context.Context, sid, taskKey, target string, focu
 	return iid, nil
 }
 
-func buildMessages(task Task, target string, c contextx.Context) []llm.Message {
+// PlainLanguage 默认目标学科：白话（非专业听众也能听懂）。
+const PlainLanguage = "白话"
+
+// targetDisciplineBlock 生成「翻译目标学科」约束块。
+// 与 session.discipline（报告人学科）不同 —— 这里指的是「把内容翻译成给谁看」。
+func targetDisciplineBlock(d string) string {
+	d = strings.TrimSpace(d)
+	if d == "" {
+		d = PlainLanguage
+	}
+	if d == PlainLanguage {
+		return "【翻译目标学科】白话 —— 用非专业听众也能听懂的日常语言表达，避免堆砌专业术语。"
+	}
+	return "【翻译目标学科】" + d + " —— 请把输出调整到该学科的研究者能直接理解、能据此提问的表达层次。"
+}
+
+func buildMessages(task Task, target string, c contextx.Context, targetDiscipline string) []llm.Message {
 	orNone := func(s string) string {
 		if s == "" {
 			return "（无）"
@@ -162,6 +180,7 @@ func buildMessages(task Task, target string, c contextx.Context) []llm.Message {
 		}
 		userParts = append(userParts, "【"+hint+"】\n"+target)
 	}
+	userParts = append(userParts, targetDisciplineBlock(targetDiscipline))
 	userParts = append(userParts, "【任务】\n"+task.Instruction)
 
 	return []llm.Message{

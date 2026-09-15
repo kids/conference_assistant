@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -26,7 +26,7 @@ from app.audio.pipeline import AudioPipeline
 from app.audio.ringbuffer import RingBuffer
 from app.audio.vad import VadSegmenter
 from app.config import BASE_DIR, get_settings
-from app.context import hotword_builder
+from app.context import document, hotword_builder
 from app.context.manager import ContextManager
 from app.context.terms import score_text
 from app.context.store import Store
@@ -60,6 +60,16 @@ class Runtime:
         # 句子键（r{轮次}i{序号}）→ seg_id 映射，用于服务端回退修正定位
         self._round_segs: dict[str, str] = {}
         self.refiner: TranscriptRefiner | None = None
+        # 目标学科：把 AI 输出翻译到该学科的表达层次。默认「白话」=非专业听众也能听懂。
+        # 注意与 session.discipline（报告人学科，仅用于热词生成）是两个不同概念。
+        self.target_discipline: str = "白话"
+
+    # ---- 目标学科 ----
+    def set_target_discipline(self, value: str) -> str:
+        """设置目标学科（下一次 AI 调用即生效），返回归一化后的值。"""
+        v = (value or "").strip() or "白话"
+        self.target_discipline = v
+        return v
 
     # ---- 热词管理 ----
     def set_session_hotwords(self, words: dict[str, int]) -> None:
@@ -298,6 +308,7 @@ class SessionIn(BaseModel):
     ai_enabled: bool = True
     replay_path: Optional[str] = None
     capture: str = "mic"  # mic（本机声卡）/ browser（远端浏览器收音）
+    target_discipline: str = "白话"  # 目标学科：把 AI 输出翻译到该学科的表达层次
 
 
 @app.post("/api/session")
@@ -305,6 +316,8 @@ async def create_session(body: SessionIn):
     sid = runtime.store.create_session(body.title, body.speaker, body.discipline,
                                        body.ai_enabled, body.institution)
     runtime.session_id = sid
+    # 新 session 从表单取值；未传则回到默认「白话」
+    runtime.set_target_discipline(body.target_discipline)
 
     # 每个 session 独立目录：materials 存报告背景等资料
     session_dir = runtime.settings.data_dir_path / sid
@@ -486,6 +499,132 @@ async def generate_hotwords(body: HotwordIn):
             "applied": applied}
 
 
+@app.post("/api/materials/upload")
+async def upload_material(file: UploadFile = File(...)):
+    """上传演示稿：解析正文 → 抽热词（即时用于 ASR）+ 生成浓缩摘要（AI 背景）。
+
+    摘要落成 materials/<名>.md，load_materials 会自动读它作为每次 AI 调用的
+    STATIC 上下文 —— 因此上传讲稿后，所有 AI 翻译都能引用讲稿内容。
+    解析原文另存 uploads/，仅供追溯，不进上下文。
+    """
+    if runtime.agent is None or runtime.agent.llm is None:
+        return JSONResponse({"error": "LLM 未配置"}, status_code=400)
+    if not runtime.session_id:
+        return JSONResponse({"error": "请先创建 session"}, status_code=400)
+
+    raw = await file.read()
+    if not raw:
+        return JSONResponse({"error": "文件为空"}, status_code=400)
+    # 只取 basename，防止用 ../ 之类构造路径穿越
+    filename = Path(file.filename or "document").name
+    if not filename or filename == ".":
+        filename = "document"
+
+    settings = runtime.settings
+    # 体积预检：网关对请求体有 2 MiB 上限，超出会被静默截断，
+    # 上游只回一个看不懂的 multipart 解析错误。这里提前拦住。
+    try:
+        document.check_upload_size(len(raw), settings.doc_max_bytes)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"error": str(e)}, status_code=413)
+
+    try:
+        doc = await asyncio.to_thread(
+            document.parse_document, settings.doc_parse_url, filename, raw
+        )
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"error": f"文档解析失败：{e}"}, status_code=502)
+
+    try:
+        profile = await asyncio.to_thread(
+            document.build_from_document, runtime.agent.llm,
+            doc["content"], settings.doc_digest_chars,
+        )
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"error": f"热词抽取失败：{e}"}, status_code=500)
+
+    session_dir = settings.data_dir_path / runtime.session_id
+    materials_dir = session_dir / "materials"
+    materials_dir.mkdir(parents=True, exist_ok=True)
+    stem = Path(filename).stem or "document"
+
+    if profile["digest"]:
+        (materials_dir / f"{stem}.md").write_text(
+            f"# 讲稿摘要：{stem}\n\n{profile['digest']}\n", encoding="utf-8"
+        )
+    uploads_dir = session_dir / "uploads"
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+    (uploads_dir / f"{stem}.txt").write_text(doc["content"], encoding="utf-8")
+
+    # 热词与已有 session 热词合并（可连续上传多份资料），同名词以新权重覆盖
+    merged = dict(runtime.session_hotwords)
+    added = 0
+    for word, weight in profile["hotwords"].items():
+        if word not in merged:
+            added += 1
+        merged[word] = weight
+    if profile["hotwords"]:
+        save_hotwords(session_dir / "hotwords.txt", merged)
+    runtime.set_session_hotwords(merged)
+
+    # 摘要改变了 STATIC 上下文，让上下文缓存失效
+    if runtime.context is not None:
+        runtime.context.invalidate_static()
+
+    # 热词已变：只重连 ASR 连接即可生效，不中断采集/转写流水线
+    if runtime.asr_client is not None:
+        runtime.asr_client.update_hotwords(runtime.active_hotwords())
+        applied = "asr_reconnect"
+    else:
+        applied = runtime.start_pipeline()
+    bus.publish({"type": "HOTWORDS_STATUS", "status": f"generated:{len(profile['hotwords'])}"})
+
+    return {
+        "ok": True,
+        "filename": doc["filename"],
+        "parsed_chars": len(doc["content"]),
+        "truncated": doc["truncated"],
+        "digest_chars": len(profile["digest"]),
+        "fields": profile["fields"],
+        "hotwords": len(profile["hotwords"]),
+        "hotwords_new": added,
+        "hotwords_total": len(merged),
+        "applied": applied,
+    }
+
+
+@app.get("/api/materials")
+async def list_materials():
+    """列出当前 session 已加载的资料（materials/ 目录）。"""
+    if not runtime.session_id:
+        return {"items": []}
+    materials_dir = runtime.settings.data_dir_path / runtime.session_id / "materials"
+    if not materials_dir.exists():
+        return {"items": []}
+    items = [
+        {"name": f.name, "chars": f.stat().st_size}
+        for f in sorted(materials_dir.iterdir())
+        if f.is_file()
+    ]
+    return {"items": items}
+
+
+class TargetDisciplineIn(BaseModel):
+    discipline: str = "白话"
+
+
+@app.get("/api/target-discipline")
+async def get_target_discipline():
+    """当前目标学科（页面加载时回填下拉框）。"""
+    return {"discipline": runtime.target_discipline}
+
+
+@app.post("/api/target-discipline")
+async def set_target_discipline(body: TargetDisciplineIn):
+    """设置目标学科（下一次 AI 调用即生效，无需重启 session）。"""
+    return {"ok": True, "discipline": runtime.set_target_discipline(body.discipline)}
+
+
 @app.get("/api/devices")
 async def list_devices():
     try:
@@ -506,12 +645,19 @@ async def invoke(body: InvokeIn):
     if runtime.agent is None or not runtime.session_id:
         return JSONResponse({"error": "请先创建 session"}, status_code=400)
     focus = runtime.store.recent_segments(runtime.session_id, seconds=60)
+    # 可中断的生成：把 LLM 客户端的 abort 注册到状态机，急停/丢弃即可立刻中断
+    # 本次生成（含 hy3 只流思考内容、没有正文增量的阶段）
+    llm_client = runtime.agent.llm
+    display.set_cancel(llm_client.abort if llm_client is not None else None)
     try:
         iid = await asyncio.to_thread(
-            runtime.agent.generate, runtime.session_id, body.task, body.target, focus
+            runtime.agent.generate, runtime.session_id, body.task, body.target, focus,
+            runtime.target_discipline,
         )
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"error": str(e)}, status_code=500)
+    finally:
+        display.set_cancel(None)
     return {"invocation_id": iid}
 
 
@@ -551,7 +697,11 @@ async def revise_invocation(iid: str, body: ReviseIn):
 
 @app.post("/api/invocation/{iid}/discard")
 async def discard_invocation(iid: str):
-    display.reset()
+    # 丢弃语义 = 不要这次输出：若它还在生成，一并中止（否则十几秒后 AI_READY 又会把卡片放回来，
+    # 等于丢弃被撤销）。这里只置中止标记，随后用 clear() 清展示状态、保留标记给在飞的生成自行退出。
+    if display.state.value == "GENERATING" and display.current == iid:
+        display.kill()
+    display.clear()
     runtime.store.set_status(iid, "discarded")
     bus.publish({"type": "AI_STATE", "state": "IDLE", "invocation_id": iid})
     return {"ok": True}
@@ -566,7 +716,10 @@ async def confirm_invocation(iid: str, body: dict):
 @app.post("/api/kill")
 async def kill():
     display.kill()
+    # 先发事件（此刻 current 还有值，大屏据此下屏），再清展示状态。
+    # 注意用 clear() 而非 reset()：reset() 会清掉急停标志，那样正在飞的生成就不会中止了。
     bus.publish({"type": "AI_KILLED", "invocation_id": display.current or ""})
+    display.clear()
     return {"ok": True}
 
 

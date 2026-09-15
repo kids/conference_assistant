@@ -48,6 +48,11 @@ type Settings struct {
 	LLMTemperature float64
 	LLMChatPath    string
 
+	// 讲稿文档解析（上传演示稿 → 抽热词 + 生成上下文摘要）
+	DocParseURL    string // /parse_doc 服务地址
+	DocDigestChars int    // 浓缩摘要目标字数（进 AI 上下文的版本）
+	DocMaxBytes    int    // 上传体积预检上限（受网关 client_max_body_size 制约）
+
 	// 音频
 	SampleRate        int
 	FrameMS           int
@@ -103,6 +108,12 @@ func Load() *Settings {
 		LLMMaxTokens:   envInt("LLM_MAX_TOKENS", 4000),
 		LLMTemperature: envFloat("LLM_TEMPERATURE", 0.3),
 		LLMChatPath:    envStr("LLM_CHAT_PATH", ""),
+
+		// 默认值与 contextx 包内的常量一致（此处写字面量以保持 config 不反向依赖业务包）
+		DocParseURL:    envStr("DOC_PARSE_URL", "https://ml-serv.ssv.qq.com/parse_doc"),
+		DocDigestChars: envInt("DOC_DIGEST_CHARS", 800),
+		// file 服务的 DefaultBodyLimit 已调到 256MB，这里取同一量级
+		DocMaxBytes: envInt("DOC_MAX_BYTES", 256<<20),
 
 		SampleRate:        envInt("SAMPLE_RATE", 16000),
 		FrameMS:           envInt("FRAME_MS", 20),

@@ -60,7 +60,13 @@ type Runtime struct {
 	roundSegs       map[string]string // 句键（r{轮次}i{序号}）→ seg_id
 	roundKeys       []string          // 插入顺序，用于裁剪
 	refiner         *agent.Refiner
+	// 目标学科：把 AI 输出调整到该学科的表达层次。默认「白话」=非专业听众也能听懂。
+	// 与 session.discipline（报告人学科，仅用于热词生成）是两个不同概念。
+	targetDiscipline string
 }
+
+// DefaultTargetDiscipline 默认目标学科。
+const DefaultTargetDiscipline = "白话"
 
 // NewRuntime 创建运行时。
 func NewRuntime(s *config.Settings) (*Runtime, error) {
@@ -79,10 +85,33 @@ func NewRuntime(s *config.Settings) (*Runtime, error) {
 		baseGlossary:    base,
 		glossary:        copyMap(base),
 		sessionHotwords: map[string]int{},
-		hotwordsEnabled: true,
-		roundSegs:       map[string]string{},
+		hotwordsEnabled:  true,
+		roundSegs:        map[string]string{},
+		targetDiscipline: DefaultTargetDiscipline,
 	}
 	return rt, nil
+}
+
+// TargetDiscipline 当前目标学科。
+func (rt *Runtime) TargetDiscipline() string {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if rt.targetDiscipline == "" {
+		return DefaultTargetDiscipline
+	}
+	return rt.targetDiscipline
+}
+
+// SetTargetDiscipline 设置目标学科，返回归一化后的值。下一次 AI 调用即生效。
+func (rt *Runtime) SetTargetDiscipline(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		v = DefaultTargetDiscipline
+	}
+	rt.mu.Lock()
+	rt.targetDiscipline = v
+	rt.mu.Unlock()
+	return v
 }
 
 // Close 释放运行时资源。
@@ -111,6 +140,14 @@ func (rt *Runtime) setSessionHotwords(words map[string]int) {
 		merged[k] = v
 	}
 	rt.glossary = merged
+}
+
+// sessionHotwordsOnly 当前 session 级热词（不含全局兜底）。
+// 用于「上传讲稿」时往上累加：全局词典继续当兜底，不被复制进 session 文件。
+func (rt *Runtime) sessionHotwordsOnly() map[string]int {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	return copyMap(rt.sessionHotwords)
 }
 
 // activeHotwords ASR 实际使用的热词：优先 session 级，否则全局；总开关关闭则返回空。

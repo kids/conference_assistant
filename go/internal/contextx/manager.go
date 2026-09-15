@@ -15,6 +15,15 @@ type Context struct {
 	History string
 }
 
+// 四块上下文各自的字符预算。STATIC 的值与 document.go 的 MaxDigestChars 有约束关系：
+// 摘要目标字数必须小于它，否则会在 Build 时被静默截断。
+const (
+	staticContextMaxChars = 2500
+	recentContextMaxChars = 2500
+	focusContextMaxChars  = 600
+	historyContextMaxChars = 400
+)
+
 // Manager 上下文组装：STATIC / RECENT / FOCUS / HISTORY 四块 + 预算控制。
 type Manager struct {
 	store        *store.Store
@@ -53,10 +62,10 @@ func (m *Manager) InvalidateStatic() {
 // Build 组装四块上下文（含字符预算截断，与 Python 版一致）。
 func (m *Manager) Build(sid string, focusSegs []store.Segment) Context {
 	return Context{
-		Static:  clipRunes(m.StaticText(), 2500),
-		Recent:  clipRunes(m.recent(sid), 2500),
-		Focus:   clipRunes(joinSegments(focusSegs), 600),
-		History: clipRunes(m.history(sid), 400),
+		Static:  clipRunes(m.StaticText(), staticContextMaxChars),
+		Recent:  clipRunes(m.recent(sid), recentContextMaxChars),
+		Focus:   clipRunes(joinSegments(focusSegs), focusContextMaxChars),
+		History: clipRunes(m.history(sid), historyContextMaxChars),
 	}
 }
 

@@ -55,6 +55,15 @@ class Settings(BaseSettings):
     # chat 端点后缀：默认空 = llm_base 即完整端点（taiji）；标准 OpenAI 可填 "/v1/chat/completions"
     llm_chat_path: str = ""
 
+    # 讲稿文档解析（控制台「解析讲稿」上传演示稿 → 抽热词 + 生成上下文摘要）
+    # 默认值与 app/context/document.py 的常量一致
+    doc_parse_url: str = "https://ml-serv.ssv.qq.com/parse_doc"
+    # 摘要目标字数上限 2400：上下文组装时 STATIC 块会被截到 2500 字
+    doc_digest_chars: int = 800
+    # 上传体积预检上限。file 服务的 DefaultBodyLimit 已调到 256MB，
+    # 这里取同一量级；该服务会把整个文件读进内存，完全放开有 OOM 风险。
+    doc_max_bytes: int = 256 << 20
+
     # 音频
     sample_rate: int = 16000
     frame_ms: int = 20

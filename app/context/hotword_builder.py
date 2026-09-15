@@ -37,7 +37,13 @@ def build_speaker_profile(
     prompt = _BUILD_PROMPT.format(
         name=name, institution=institution or "未知", discipline=discipline or "未知"
     )
-    raw = llm.chat([{"role": "user", "content": prompt}], max_tokens=2000, temperature=0.2)
+    # max_tokens 与 timeout 都必须给足：hy3 的 reasoning 与正文共享 max_tokens
+    # （实测 2000 会被思考吃光、正文 0 字），且思考时长随 prompt 波动很大
+    # （同一 prompt 实测 28~37s）。这里按调用给 90s，而不是依赖默认的 30s。
+    raw = llm.chat(
+        [{"role": "user", "content": prompt}],
+        max_tokens=6000, temperature=0.2, timeout=90.0,
+    )
     data = _parse_json(raw)
 
     hotwords: dict[str, int] = {}
@@ -53,8 +59,13 @@ def build_speaker_profile(
             weight = 50
         hotwords[w] = max(1, min(100, weight))
 
+    profile = str(data.get("profile", "")).strip()
+    # 空结果必须报错：LLM 偶发返回空/非 JSON 正文时，静默返回空 profile 会让
+    # 调用方显示「成功但 0 个热词」，极难排查。
+    if not profile and not hotwords:
+        raise RuntimeError(f"LLM 未返回有效内容（原始输出 {len(raw)} 字）: {raw[:200]}")
     return {
-        "profile": str(data.get("profile", "")).strip(),
+        "profile": profile,
         "fields": [str(f).strip() for f in data.get("fields", []) if str(f).strip()],
         "hotwords": hotwords,
     }

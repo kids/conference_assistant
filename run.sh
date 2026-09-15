@@ -2,6 +2,10 @@
 set -e
 cd "$(dirname "$0")"
 
+# Python 版已封板（deprecated）：不再新增功能，代码保留作对照与应急回退。
+# 生产部署请用 Go 版（go/ 下 go build 出 ./seat，或用 Dockerfile 构建镜像）。
+echo "[run] 注意：Python 版已封板，仅用于对照排查；生产部署请使用 Go 版。"
+
 # 若无 .env，从 .env.example 生成
 if [ ! -f .env ]; then
   echo "[run] .env 不存在，已从 .env.example 生成，请填写 LLM_BASE/LLM_KEY 后重跑"

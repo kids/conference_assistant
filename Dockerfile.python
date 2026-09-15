@@ -1,7 +1,10 @@
-# AI 跨学科实时翻译席 —— 容器镜像
+# AI 跨学科实时翻译席 —— 容器镜像（Python 版，已封板）
+#
+# 【已封板 deprecated】不再新增功能，代码保留作对照与应急回退。
+# 生产部署请用 Dockerfile（Go 版）：docker build -t translation-seat:latest .
 #
 # 构建：
-#   docker build -t translation-seat:latest .
+#   docker build -f Dockerfile.python -t translation-seat:py .
 #
 # 运行（推荐挂载 .env 与 sessions，配置密钥不进镜像）：
 #   docker run -d --name translation-seat \

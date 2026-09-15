@@ -6,11 +6,16 @@
 
 ## 两种实现
 
-本仓库有两套**功能等价、接口兼容**的实现，可随时切换：
+本仓库有两套**功能等价、接口兼容**的实现：
 
-|  | **Go 版**（`go/`） | Python 版（`app/`） |
+> **Python 版（`app/`）已封板（deprecated）** —— 自 2026-09 起不再新增功能，代码保留、暂不删除。
+> **所有新改动只进 Go 版（`go/`）**，即 `Dockerfile` 构建的默认部署版本。
+> 保留它的唯一目的是：Go 版出现疑难问题时，可切回 Python 版对照定位。
+> **不要在其上开发新功能** —— 两版已经出现行为差异（见下文「与 Python 版的已知行为差异」）。
+
+|  | **Go 版**（`go/`） | Python 版（`app/`，已封板） |
 |---|---|---|
-| 定位 | **默认部署版本**（`Dockerfile` 构建它） | 保留可用，作为回退与对照 |
+| 定位 | **默认部署版本**（`Dockerfile` 构建它） | **已封板**：只读保留，作对照与应急回退 |
 | 前端页面 | 同一套页面，`go:embed` 进二进制（`go/web/` 与 `app/web/` 逐字一致） | 从磁盘读取 |
 | HTTP / WebSocket 接口 | 与 Python 版完全一致 | — |
 | SQLite 表结构 | 与 Python 版完全一致，可共用同一份 `sessions/transcript.sqlite` | 同 |
@@ -67,7 +72,9 @@ Go 版有 4 个 cgo 依赖，需要 `gcc` / `g++`：
 4. **中文分词边界个别句子不同**：gojieba 与 Python jieba 同源但非逐字一致，实测 10 句样本中 6 句完全相同；差异处各有得失（`带隙`/`隧穿` 被合并成词反而多识别出术语，`X射线` 被拆开少识别一个），净效果基本中性。
 5. `GET /api/devices` 改用 malgo 枚举，返回字段与 Python 版的 sounddevice 不同（仅调试接口）。
 
-## 快速开始（Python 版）
+## 快速开始（Python 版，已封板）
+
+> 仅用于**对照排查**或应急回退，不要在其上开发新功能。生产部署请用上面的 Go 版。
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
@@ -79,14 +86,14 @@ cp .env.example .env
 ./run.sh          # 或 uvicorn app.main:app --host 127.0.0.1 --port 8080
 ```
 
-`run.sh` 默认绑定 `0.0.0.0:8081`（避开常被 IDE 占用的 8080），并带 `--reload`。
+`run.sh` 默认绑定 `0.0.0.0:8081`（避开常被 IDE 占用的 8080），并带 `--reload`。启动时会打印一行封板告警。
 
 ## Docker 部署
 
 ```bash
 # Go 版（默认）
 docker build -t translation-seat:latest .
-# Python 版
+# Python 版（已封板，仅对照用）
 docker build -f Dockerfile.python -t translation-seat:py .
 
 docker run -d --name translation-seat -p 8081:8081 \
@@ -199,13 +206,13 @@ python tools/check_env.py        # Python 版
 ## 目录
 
 ```
-app/            Python 版（FastAPI：audio 采集/断句、asr 流式、context、agent、providers）
+app/            Python 版（FastAPI：audio 采集/断句、asr 流式、context、agent、providers）—— 已封板
 app/web/        console.html / screen.html（零框架原生前端）
 go/             Go 版（internal/{config,events,state,store,llm,asr,audio,contextx,agent,server}）
 go/web/         与 app/web/ 逐字一致，编译时 embed 进二进制
 go/tools/mockasr  本地假 ASR 服务（离线验证整条流水线）
 Dockerfile      Go 版镜像（默认）
-Dockerfile.python  Python 版镜像
+Dockerfile.python  Python 版镜像（已封板，仅对照用）
 sessions/       运行数据（SQLite 转写库、session 资料、复盘导出）
 tools/          check_env.py 环境自检（Python 版）
 ```

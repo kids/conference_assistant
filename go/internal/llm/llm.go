@@ -58,8 +58,12 @@ func New(baseURL, apiKey, model string, timeout float64, chatPath string) *Clien
 			Timeout:   d,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		TLSHandshakeTimeout:   d,
-		ResponseHeaderTimeout: d,
+		TLSHandshakeTimeout: d,
+		// 刻意不设 ResponseHeaderTimeout：它限制的是「连接建立到收到响应头」的时长，
+		// 而非流式请求必须等整段生成完才会发响应头。hy3 是思考模型（实测 28~37s），
+		// 而 LLM_TIMEOUT 默认 30s —— 设上它会让 ChatTimeout 的「按调用给足预算」
+		// 完全失效（调用方传 90s/120s 也没用，30s 就先超时了）。
+		// 挂死场景由每次调用的 ctx 超时兜底（ChatTimeout / streamBudget 都会设）。
 		ExpectContinueTimeout: 1 * time.Second,
 		MaxIdleConns:          16,
 		IdleConnTimeout:       90 * time.Second,

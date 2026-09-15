@@ -5,6 +5,7 @@
 package state
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 )
@@ -26,6 +27,18 @@ type Display struct {
 	current string // invocation_id
 	task    string
 	kill    atomic.Bool
+	// cancelGen 当前在飞生成的取消函数。
+	// 必需：hy3 思考阶段只流 reasoning_content，正文 delta 一个都没有，
+	// 靠"每个 delta 查一次急停标志"在思考期间完全失效 —— 实测按下急停后
+	// 仍要等 10~30s 思考结束才真正中止。用 context 取消才能真正立即中断。
+	cancelGen context.CancelFunc
+}
+
+// SetCancel 注册当前生成的中止函数；传 nil 表示生成已结束。
+func (d *Display) SetCancel(fn context.CancelFunc) {
+	d.mu.Lock()
+	d.cancelGen = fn
+	d.mu.Unlock()
 }
 
 // New 创建初始为 IDLE 的状态机。
@@ -76,6 +89,19 @@ func (d *Display) Show() {
 	d.mu.Unlock()
 }
 
+// Clear 只清展示状态（state/current/task → IDLE），**不动急停标记**。
+//
+// 用于急停/丢弃：既要把卡片从大屏撤下、让 state/current 不再指向那张卡，
+// 又必须保留急停标记 —— 若在这里把它清掉，正在飞的那次生成就永远不会中止，
+// 急停的主功能反而失效。
+func (d *Display) Clear() {
+	d.mu.Lock()
+	d.state = IDLE
+	d.current = ""
+	d.task = ""
+	d.mu.Unlock()
+}
+
 // Reset 回到 IDLE 并清除急停标记。
 func (d *Display) Reset() {
 	d.kill.Store(false)
@@ -87,7 +113,17 @@ func (d *Display) Reset() {
 }
 
 // Kill 立即中止生成 / 下屏。幂等。
-func (d *Display) Kill() { d.kill.Store(true) }
+// 除了置标志，还会直接取消在飞生成的 context —— 思考阶段没有正文 delta，
+// 只置标志的话要等思考结束才生效。
+func (d *Display) Kill() {
+	d.kill.Store(true)
+	d.mu.Lock()
+	fn := d.cancelGen
+	d.mu.Unlock()
+	if fn != nil {
+		fn()
+	}
+}
 
 // Killed 是否已急停。
 func (d *Display) Killed() bool { return d.kill.Load() }

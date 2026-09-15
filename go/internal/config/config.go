@@ -29,6 +29,10 @@ type Settings struct {
 	Qwen3Backend       string
 	Qwen3Model         string
 	ASRPartialInterval float64
+	// ASRInferTimeout qwen3_http 单次推理超时（秒）。
+	// 与 LLMTimeout 分开：LLM 生成与 ASR 转写的合理超时不同，且服务端偶发排队时
+	// ASR 需要更宽的容忍度（实测同一段音频延迟在 0.8s~60s 间波动）。
+	ASRInferTimeout float64
 
 	ASRChunkSize    string
 	ASRLanguage     string
@@ -52,6 +56,9 @@ type Settings struct {
 	DocParseURL    string // /parse_doc 服务地址
 	DocDigestChars int    // 浓缩摘要目标字数（进 AI 上下文的版本）
 	DocMaxBytes    int    // 上传体积预检上限（受网关 client_max_body_size 制约）
+	// DocParseTimeout 单次解析的超时（秒）。解析耗时随体积线性增长：实测 17MB→17s、
+	// 22MB→31s，120s 余量偏紧（网络慢或服务端排队时会误报「不可达」）。
+	DocParseTimeout float64
 
 	// 音频
 	SampleRate        int
@@ -92,6 +99,7 @@ func Load() *Settings {
 		Qwen3Backend:       envStr("QWEN3_BACKEND", "https://asr.example.com/s2"),
 		Qwen3Model:         envStr("QWEN3_MODEL", "qwen3asr17b"),
 		ASRPartialInterval: envFloat("ASR_PARTIAL_INTERVAL", 1.0),
+		ASRInferTimeout:    envFloat("ASR_INFER_TIMEOUT", 60.0),
 
 		ASRChunkSize:    envStr("ASR_CHUNK_SIZE", "5,10,5"),
 		ASRLanguage:     envStr("ASR_LANGUAGE", "中文"),
@@ -114,6 +122,8 @@ func Load() *Settings {
 		DocDigestChars: envInt("DOC_DIGEST_CHARS", 800),
 		// file 服务的 DefaultBodyLimit 已调到 256MB，这里取同一量级
 		DocMaxBytes: envInt("DOC_MAX_BYTES", 256<<20),
+		// 解析超时：给大文件与慢链路留余量（原硬编码 120s，22MB 已耗 31s，余量偏紧）
+		DocParseTimeout: envFloat("DOC_PARSE_TIMEOUT", 180.0),
 
 		SampleRate:        envInt("SAMPLE_RATE", 16000),
 		FrameMS:           envInt("FRAME_MS", 20),

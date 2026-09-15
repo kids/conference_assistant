@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -305,15 +306,24 @@ func (s *Server) handleUploadMaterial(w http.ResponseWriter, r *http.Request) {
 		filename = "document"
 	}
 
-	// 上限须大于 解析(120s) + LLM(120s) 之和
-	ctx, cancel := contextWithTimeout(300 * time.Second)
+	// 解析超时可配（DOC_PARSE_TIMEOUT，默认 180s）；外层 ctx 必须大于 解析 + LLM 之和
+	parseTimeout := time.Duration(s.rt.Settings.DocParseTimeout * float64(time.Second))
+	if parseTimeout <= 0 {
+		parseTimeout = 180 * time.Second
+	}
+	ctx, cancel := contextWithTimeout(parseTimeout + 180*time.Second)
 	defer cancel()
 
-	doc, err := contextx.ParseDocument(ctx, s.rt.Settings.DocParseURL, filename, data)
+	// 体积与耗时都打日志：解析失败时这两个数字是判断「服务慢」还是「网络不通」的唯一依据
+	log.Printf("[upload] 解析讲稿：%s（%.1f MB，超时 %.0fs）", filename, float64(len(data))/(1<<20), parseTimeout.Seconds())
+	parseStart := time.Now()
+	doc, err := contextx.ParseDocument(ctx, s.rt.Settings.DocParseURL, filename, data, parseTimeout)
 	if err != nil {
+		log.Printf("[upload] 解析失败（已等 %.1fs）：%v", time.Since(parseStart).Seconds(), err)
 		writeJSON(w, 502, map[string]any{"error": "文档解析失败：" + err.Error()})
 		return
 	}
+	log.Printf("[upload] 解析完成：正文 %d 字，耗时 %.1fs", len([]rune(doc.Content)), time.Since(parseStart).Seconds())
 
 	profile, err := contextx.BuildFromDocument(ctx, ag.LLM, doc.Content, s.rt.Settings.DocDigestChars)
 	if err != nil {
@@ -639,14 +649,15 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"asr":          info.State,
 		"asr_detail":   info.Detail,
 		"asr_idle_sec": info.IdleSec,
-		"llm":          llmStatus,
-		"llm_model":    st.LLMModel,
-		"protocol":     st.ASRProtocol,
-		"asr_ws_url":   asrURL,
-		"capture":      s.rt.CaptureMode(),
-		"mic":          micState,
-		"state":        string(s.rt.Display.State()),
+		// 连续推理失败次数：用来区分「确实没语音」与「有语音但推理一直失败」——
+		// 没有这个字段时两者都只表现为 asr_idle_sec 不断增长，从外部无法分辨。
+		"asr_infer_fail": info.InferFail,
+		"llm":            llmStatus,
+		"llm_model":      st.LLMModel,
+		"protocol":       st.ASRProtocol,
+		"asr_ws_url":     asrURL,
+		"capture":        s.rt.CaptureMode(),
+		"mic":            micState,
+		"state":          string(s.rt.Display.State()),
 	})
 }
-
-

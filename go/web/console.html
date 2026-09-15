@@ -57,8 +57,7 @@
 <div id="errBar" style="display:none;position:fixed;left:0;right:0;bottom:0;z-index:99;background:#5a1d1d;color:#ffd7d7;font-size:12px;padding:6px 12px;border-top:1px solid #f85149"></div>
 <header>
   <h1>AI 跨学科实时翻译席 · 控制台</h1>
-  <input type="text" id="speaker" placeholder="科学家姓名" style="width:120px">
-  <input type="text" id="institution" placeholder="机构（可选）" style="width:150px">
+  <!-- 姓名/机构输入框已下线：热词改由「解析讲稿」生成（上传演示稿 → 抽词 + 摘要），不再依赖报告人信息 -->
   <label class="capcheck" title="勾选＝用浏览器麦克风采音，经 WebSocket 推给服务器识别（远端/服务器无声卡时用）；不勾选＝用服务器本机声卡。改动在下次点「开始 Session」时生效。"><input type="checkbox" id="capBrowser" checked>浏览器收音</label>
   <button id="btnSession" class="primary">开始 Session</button>
   <button id="btnMicStop" class="danger" style="display:none" title="关闭浏览器麦克风采集（服务端流水线继续运行，可用「开始 Session」重新开启）">停止收音</button>
@@ -182,12 +181,12 @@ function handle(m){
       break;
     case "HOTWORDS_STATUS":
       const hw=m.status;
-      if(hw==="generating"){ $("sessionInfo").textContent="正在为 "+m.speaker+" 重新生成热词…"; $("hwStatus").textContent="生成中…"; }
-      else if(hw.startsWith("generated:")){ $("sessionInfo").textContent=(m.speaker?m.speaker+" · ":"")+"热词已重新生成："+hw.slice("generated:".length)+" 个";
+      if(hw==="generating"){ $("sessionInfo").textContent="正在重新生成热词…"; $("hwStatus").textContent="生成中…"; }
+      else if(hw.startsWith("generated:")){ $("sessionInfo").textContent="热词已重新生成："+hw.slice("generated:".length)+" 个";
         $("hwStatus").textContent="生成完成："+hw.slice("generated:".length)+" 个";
         if(document.activeElement!==$("hwText")) loadHotwords(); }   // 编辑中不覆盖输入
       else if(hw.startsWith("failed:")){ $("sessionInfo").textContent="热词生成失败："+hw.slice("failed:".length); $("hwStatus").textContent="生成失败"; }
-      else if(hw==="skipped:no_speaker"){ $("sessionInfo").textContent="未填写科学家姓名，跳过热词生成（可使用全局热词）"; }
+      // skipped:no_speaker 现在是正常情况（姓名框已下线，热词改由「解析讲稿」生成），不再提示
       else if(hw==="skipped:llm_unavailable"){ $("sessionInfo").textContent="LLM 未配置，跳过热词生成"; }
       break;
     case "SESSION": sid=m.session_id; $("sessionInfo").textContent=m.title+" · "+m.session_id; break;
@@ -239,22 +238,22 @@ async function invoke(task,target){
 async function startSession(){
   // 元素缺失一律降级为默认值：任何一处取不到都不能让整个启动流程中断（否则会永久停在「启动中…」）
   const el=id=>$(id);
-  const speaker=el("speaker")?el("speaker").value.trim():"";
-  const institution=el("institution")?el("institution").value.trim():"";
+  // 姓名/机构已下线：热词改由「解析讲稿」生成，不再依赖报告人信息。
+  // 接口仍接受这两个字段，传空串即跳过按人生成（服务端会标记 skipped:no_speaker）。
   // 「浏览器收音」开关决定音源：勾选＝浏览器采音；不勾选＝服务器本机声卡
   const capture=(el("capBrowser")&&el("capBrowser").checked)?"browser":"mic";
   const td=el("targetDiscipline");
   const targetDiscipline=(td&&td.value.trim())?td.value.trim():"白话";
   $("sessionInfo").textContent="启动中…";
   try{
-    const r=await post("/api/session",{title:"Workshop",speaker,institution,discipline:"",target_discipline:targetDiscipline,ai_enabled:true,capture});
+    const r=await post("/api/session",{title:"Workshop",speaker:"",institution:"",discipline:"",target_discipline:targetDiscipline,ai_enabled:true,capture});
     if(!r.pipeline||!r.pipeline.ok){
       $("sessionInfo").textContent="启动失败："+((r.pipeline&&r.pipeline.msg)||"服务端未返回流水线信息");
       alert("音频采集失败："+(r.pipeline&&r.pipeline.msg));
       return;
     }
     sid=r.session_id;   // 直接取响应里的 id，不等 WS 的 SESSION 事件（否则自动开麦时 sid 可能还是空）
-    let info=(speaker?speaker+" · ":"")+r.session_id;
+    let info=r.session_id;
     // 以服务端**实际生效**的音源为准：本机声卡打开失败时服务端会自动降级为 browser，
     // 这时也必须把浏览器麦克风打开，否则没有音频进来。
     if(r.pipeline.capture==="browser"){
@@ -263,7 +262,6 @@ async function startSession(){
       info+=ok?"（麦克风已开启）":"（麦克风未开启，见下方提示）";
     }else{
       info+=" · 服务器本机麦克风";
-      if(speaker) info+=" · 热词后台生成中…";
     }
     if(r.pipeline.note) info+=" · "+r.pipeline.note;
     $("sessionInfo").textContent=info;
@@ -301,9 +299,19 @@ addEventListener("keydown",e=>{
 // 健康检查（ASR 状态来自流水线真实连接）
 setInterval(async()=>{ try{ const h=await fetch(BASE+"/api/health").then(r=>r.json());
   const a=h.asr;
+  // 「无语音」与「推理失败」必须分开显示。后端已保证：推理失败时状态是 error（不再被
+  // connected 覆盖），所以能走到下面「已连接 · 无语音」时，就真的是没有语音输入。
   if(a==="connected"){ $("asrDot").className="dot ok"; $("asrStatus").textContent="ASR: 已连接"+(h.asr_idle_sec>15?(" · 无语音 "+Math.round(h.asr_idle_sec)+"s"):""); }
   else if(a==="connecting"){ $("asrDot").className="dot warn"; $("asrStatus").textContent="ASR: 连接失败，重连中"+(h.asr_detail?" · "+h.asr_detail:""); }
-  else if(a==="error"){ $("asrDot").className="dot bad"; $("asrStatus").textContent="ASR: 连接中断，等待重连"; }
+  else if(a==="error"){
+    $("asrDot").className="dot bad";
+    const d=String(h.asr_detail||""), n=h.asr_infer_fail||0;
+    // qwen3_http 的 error 是「推理失败」而非连接问题 —— 必须显示原因，
+    // 否则和「有语音但识别不出字」无法区分（旧版两者都只显示「无语音」）。
+    $("asrStatus").textContent=/^error:infer:/.test(d)
+      ? ("ASR: 推理失败"+(n>1?(" 连续"+n+"次"):"")+" · "+d.replace(/^error:infer:/,"").slice(0,70))
+      : "ASR: 连接中断，等待重连";
+  }
   else if(a==="closed"){ $("asrDot").className="dot bad"; $("asrStatus").textContent="ASR: 已断开，等待重连"; }
   else if(a==="idle"){ $("asrDot").className="dot"; $("asrStatus").textContent="ASR: 未启动 · 点「开始 Session」"; }
   else { $("asrDot").className="dot warn"; $("asrStatus").textContent="ASR:"+a; }

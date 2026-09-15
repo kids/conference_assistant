@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -30,7 +31,37 @@ const (
 	qwenFrameMS    = 30
 	qwenSampleRate = 16000
 	qwenFrameBytes = qwenSampleRate * 2 * qwenFrameMS / 1000
+
+	// qwenInferAttempts 单次推理的最大尝试次数（=1 次重试）。
+	// 服务端在并发时会秒级到分钟级地排队：实测同一段 20s 音频的延迟在 0.8s~60s 之间波动。
+	// 旧版单次超时即丢一整句，观感就是「字幕时有时无」；重试一次常能命中空闲窗口。
+	qwenInferAttempts = 2
+	// qwenRetryBackoff 重试前等待，给服务端一点排空时间。
+	qwenRetryBackoff = 400 * time.Millisecond
 )
+
+// inferHTTPError 非 200 响应。单独成类型是为了区分「值得重试」与「重试也没用」：
+// 4xx 是请求本身的问题（模型名、参数非法），重试只会得到同样结果。
+type inferHTTPError struct {
+	Status int
+	Body   string
+}
+
+func (e *inferHTTPError) Error() string {
+	if e.Body == "" {
+		return fmt.Sprintf("HTTP %d", e.Status)
+	}
+	return fmt.Sprintf("HTTP %d %s", e.Status, e.Body)
+}
+
+// retryableInferErr 超时/连接失败/响应解析失败/5xx → 重试；4xx → 不重试。
+func retryableInferErr(err error) bool {
+	var he *inferHTTPError
+	if errors.As(err, &he) {
+		return he.Status >= 500
+	}
+	return true
+}
 
 // langMap 语言别名 → ISO 639-1（vLLM transcriptions 仅接受 ISO 码）。
 var langMap = map[string]string{
@@ -39,32 +70,32 @@ var langMap = map[string]string{
 
 // Qwen3AsrHttpClient Qwen3-ASR HTTP 转写客户端（模拟流式）。
 type Qwen3AsrHttpClient struct {
-	baseURL        string
-	model          string
-	language       string
+	baseURL         string
+	model           string
+	language        string
 	partialInterval float64
-	vadSilenceMS   int
-	maxSegmentS    float64
-	inferTimeoutS  float64
-	handlers       Handlers
+	vadSilenceMS    int
+	maxSegmentS     float64
+	inferTimeoutS   float64
+	handlers        Handlers
 
 	http *http.Client
 
-	mu           sync.Mutex
-	hotwords     []string
-	buf          []byte // 自上一确认句起的音频
-	frameBuf     []byte // 任意 chunk → 30ms 帧重组
-	inSpeech     bool
-	speechFrames int
+	mu            sync.Mutex
+	hotwords      []string
+	buf           []byte // 自上一确认句起的音频
+	frameBuf      []byte // 任意 chunk → 30ms 帧重组
+	inSpeech      bool
+	speechFrames  int
 	silenceFrames int
-	speechSeen   bool
-	lastPartial  float64
-	round        int
-	forceFinal   bool
-	status       string
-	detail       string
-	lastActive   time.Time
-	inferFail    int
+	speechSeen    bool
+	lastPartial   float64
+	round         int
+	forceFinal    bool
+	status        string
+	detail        string
+	lastActive    time.Time
+	inferFail     int
 
 	vad  *webrtcvad.VAD
 	stop chan struct{}
@@ -201,7 +232,7 @@ func (c *Qwen3AsrHttpClient) StatusInfo() StatusInfo {
 	if !c.lastActive.IsZero() {
 		idle = time.Since(c.lastActive).Seconds()
 	}
-	return StatusInfo{State: c.status, Detail: c.detail, IdleSec: round1(idle)}
+	return StatusInfo{State: c.status, Detail: c.detail, IdleSec: round1(idle), InferFail: c.inferFail}
 }
 
 // Close 停止调度协程并释放资源。
@@ -249,7 +280,50 @@ func (c *Qwen3AsrHttpClient) bufSec() float64 {
 }
 
 // infer 整段推理，返回文本（失败返回空串）。
+//
+// 鲁棒性：失败重试一次，并把结果反映到状态与日志上。旧版单次超时就静默返回空串，
+// 且紧随其后的 setStatus("connected") 会把错误覆盖掉 —— 结果「有语音但推理一直失败」
+// 与「确实没语音」在页面上长得一模一样，只能靠猜。
 func (c *Qwen3AsrHttpClient) infer(pcm []byte) string {
+	var lastErr error
+	for attempt := 1; attempt <= qwenInferAttempts; attempt++ {
+		text, err := c.inferOnce(pcm)
+		if err == nil {
+			c.mu.Lock()
+			prevFail := c.inferFail
+			c.inferFail = 0
+			c.mu.Unlock()
+			if prevFail > 0 {
+				log.Printf("[asr] qwen3 推理恢复正常（此前连续失败 %d 次）", prevFail)
+			}
+			c.setStatus("connected")
+			return text
+		}
+		lastErr = err
+		if !retryableInferErr(err) {
+			break
+		}
+		if attempt < qwenInferAttempts {
+			log.Printf("[asr] qwen3 推理失败（第 %d/%d 次，超时 %.0fs）：%v —— 重试",
+				attempt, qwenInferAttempts, c.inferTimeoutS, err)
+			select {
+			case <-time.After(qwenRetryBackoff):
+			case <-c.stop:
+				return ""
+			}
+		}
+	}
+	c.mu.Lock()
+	c.inferFail++
+	fails := c.inferFail
+	c.mu.Unlock()
+	log.Printf("[asr] qwen3 推理失败（连续 %d 次，本段丢弃）：%v", fails, lastErr)
+	c.setStatus("error:infer:" + lastErr.Error())
+	return ""
+}
+
+// inferOnce 单次推理尝试；err 非空表示这次尝试失败（含 HTTP 非 200）。
+func (c *Qwen3AsrHttpClient) inferOnce(pcm []byte) (string, error) {
 	c.mu.Lock()
 	model, language := c.model, c.language
 	hotwords := append([]string(nil), c.hotwords...)
@@ -259,10 +333,10 @@ func (c *Qwen3AsrHttpClient) infer(pcm []byte) string {
 	mw := multipart.NewWriter(&body)
 	part, err := mw.CreateFormFile("file", "a.wav")
 	if err != nil {
-		return ""
+		return "", err
 	}
 	if _, err := part.Write(pcmToWAV(pcm, qwenSampleRate)); err != nil {
-		return ""
+		return "", err
 	}
 	_ = mw.WriteField("model", model)
 	_ = mw.WriteField("language", language)
@@ -270,7 +344,7 @@ func (c *Qwen3AsrHttpClient) infer(pcm []byte) string {
 		_ = mw.WriteField("hotwords", strings.Join(hotwords, ","))
 	}
 	if err := mw.Close(); err != nil {
-		return ""
+		return "", err
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(c.inferTimeoutS*float64(time.Second)))
@@ -278,39 +352,31 @@ func (c *Qwen3AsrHttpClient) infer(pcm []byte) string {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		c.baseURL+"/v1/audio/transcriptions", &body)
 	if err != nil {
-		return ""
+		return "", err
 	}
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		c.mu.Lock()
-		c.inferFail++
-		c.mu.Unlock()
-		c.setStatus("error:infer:" + err.Error())
-		return ""
+		return "", err
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != http.StatusOK {
-		c.mu.Lock()
-		c.inferFail++
-		c.mu.Unlock()
-		c.setStatus(fmt.Sprintf("error:infer:HTTP %d", resp.StatusCode))
-		return ""
+		msg := strings.TrimSpace(string(raw))
+		if len(msg) > 200 {
+			msg = msg[:200]
+		}
+		return "", &inferHTTPError{Status: resp.StatusCode, Body: msg}
 	}
-
-	c.mu.Lock()
-	c.inferFail = 0
-	c.mu.Unlock()
 
 	var out struct {
 		Text string `json:"text"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return ""
+		return "", fmt.Errorf("响应解析失败: %w", err)
 	}
-	return strings.TrimSpace(out.Text)
+	return strings.TrimSpace(out.Text), nil
 }
 
 // finalize 句尾确认：整段推理 → 终稿。
@@ -349,7 +415,7 @@ func (c *Qwen3AsrHttpClient) finalize() {
 			c.handlers.OnOffline(fmt.Sprintf("h%d", round), text)
 		}
 	}
-	c.setStatus("connected")
+	// 不在这里设 "connected"：状态由 infer 统一负责，否则会把刚发生的推理错误覆盖掉。
 }
 
 // partial 周期草稿重推。
@@ -375,7 +441,7 @@ func (c *Qwen3AsrHttpClient) partial() {
 	if c.handlers.OnOnline != nil {
 		c.handlers.OnOnline(text)
 	}
-	c.setStatus("connected")
+	// 同上：不覆盖 infer 已设好的状态。
 }
 
 // scheduler 调度协程：partial 周期重推 + VAD 句尾 final + 超长强制切句。

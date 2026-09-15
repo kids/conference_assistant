@@ -76,15 +76,15 @@ func NewRuntime(s *config.Settings) (*Runtime, error) {
 	}
 	base := asr.LoadHotwords(s.HotwordsFile())
 	rt := &Runtime{
-		Settings:        s,
-		Store:           st,
-		Bus:             events.New(800),
-		Display:         state.New(),
-		captureMode:     "mic",
-		ring:            audio.NewRingBuffer(120, s.SampleRate),
-		baseGlossary:    base,
-		glossary:        copyMap(base),
-		sessionHotwords: map[string]int{},
+		Settings:         s,
+		Store:            st,
+		Bus:              events.New(800),
+		Display:          state.New(),
+		captureMode:      "mic",
+		ring:             audio.NewRingBuffer(120, s.SampleRate),
+		baseGlossary:     base,
+		glossary:         copyMap(base),
+		sessionHotwords:  map[string]int{},
 		hotwordsEnabled:  true,
 		roundSegs:        map[string]string{},
 		targetDiscipline: DefaultTargetDiscipline,
@@ -300,9 +300,11 @@ func (rt *Runtime) StartPipeline(replayPath, captureMode string) (map[string]any
 		// 句尾静音即发 STOP 让服务端立刻 flush，出字延迟降到约 0.8s
 		serverVAD = !s.LocalVADSegment
 	case "qwen3_http":
+		// 推理超时用 ASRInferTimeout 而非 LLMTimeout：两者合理值不同，
+		// 且服务端排队抖动时 ASR 需要更宽的容忍度（实测 0.8s~60s）。
 		client, err := asr.NewQwen3AsrHttpClient(s.Qwen3Backend, s.Qwen3Model, s.ASRLanguage,
 			hotwordList, s.ASRPartialInterval, s.VADSilenceMS, s.VADAggressiveness,
-			float64(s.MaxSegmentS), s.LLMTimeout, handlers)
+			float64(s.MaxSegmentS), s.ASRInferTimeout, handlers)
 		if err != nil {
 			return nil, err
 		}

@@ -7,6 +7,10 @@ type StatusInfo struct {
 	State   string
 	Detail  string
 	IdleSec float64
+	// InferFail 连续推理失败次数（任一次成功即清零）。
+	// 用来区分两种外观完全相同的故障：「确实没有语音」与「有语音但推理一直失败」——
+	// 旧版两者都只表现为「无语音」，从页面上无法分辨。
+	InferFail int
 }
 
 // Handlers 客户端回调。
@@ -15,10 +19,10 @@ type StatusInfo struct {
 // 而 Python 版是回调内部去读 asr_client.last_sentence_key 属性——那是"先写属性再回调"
 // 的隐式约定，在多线程下不可靠。这里改为显式传参。
 type Handlers struct {
-	OnOnline  func(text string)          // 实时草稿
-	OnOffline func(key, text string)     // 确认终稿
-	OnRevise  func(key, text string)     // 服务端回退修正
-	OnStatus  func(status string)        // 原始状态串（前端状态条）
+	OnOnline  func(text string)      // 实时草稿
+	OnOffline func(key, text string) // 确认终稿
+	OnRevise  func(key, text string) // 服务端回退修正
+	OnStatus  func(status string)    // 原始状态串（前端状态条）
 }
 
 // Client 流式 ASR 客户端统一接口。

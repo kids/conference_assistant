@@ -52,7 +52,9 @@ const docMaxInputChars = 20000
 // 该服务会把整个文件读进内存（field.bytes()），完全放开有 OOM 风险。
 //
 // 踩坑记录（2026-09，以免重蹈）：当时 >2MB 的上传报
-//   "multipart bytes error: Error parsing `multipart/form-data` request"
+//
+//	"multipart bytes error: Error parsing `multipart/form-data` request"
+//
 // 曾误判为网关 client_max_body_size，但实测网关侧 JSON 32MB 都能完整到达、
 // 且 Kong 配置里 client_max_body_size=0（不限制）—— 真正原因是 axum 的
 // Multipart 提取器读 DefaultBodyLimit（默认 2MB），而服务里只设了
@@ -77,8 +79,8 @@ func CheckUploadSize(n, maxBytes int) error {
 
 // ParsedDoc 解析结果。
 type ParsedDoc struct {
-	Filename string
-	Content  string
+	Filename  string
+	Content   string
 	Truncated bool // 是否因超出 docMaxInputChars 被截断
 }
 
@@ -94,7 +96,10 @@ type docRow struct {
 //
 //	请求  POST multipart/form-data，字段名 file
 //	响应  [{"content":"正文","filename":"文件名"}]
-func ParseDocument(ctx context.Context, parseURL, filename string, data []byte) (*ParsedDoc, error) {
+//
+// timeout ≤ 0 时退回包内默认值。失败信息会带上体积与已耗时 —— 否则「服务慢」与
+// 「网络不通」都只报一句 context deadline exceeded，从外部完全无法区分。
+func ParseDocument(ctx context.Context, parseURL, filename string, data []byte, timeout time.Duration) (*ParsedDoc, error) {
 	if strings.TrimSpace(parseURL) == "" {
 		parseURL = DefaultDocParseURL
 	}
@@ -112,7 +117,10 @@ func ParseDocument(ctx context.Context, parseURL, filename string, data []byte) 
 		return nil, fmt.Errorf("关闭上传体失败: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, docParseTimeout)
+	if timeout <= 0 {
+		timeout = docParseTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, parseURL, &body)
 	if err != nil {
@@ -120,9 +128,11 @@ func ParseDocument(ctx context.Context, parseURL, filename string, data []byte) 
 	}
 	req.Header.Set("Content-Type", w.FormDataContentType())
 
+	started := time.Now()
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("文档解析服务不可达: %w", err)
+		return nil, fmt.Errorf("文档解析服务不可达（%s，%.1f MB，超时 %.0fs，已等 %.1fs）: %w",
+			parseURL, float64(len(data))/(1<<20), timeout.Seconds(), time.Since(started).Seconds(), err)
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))

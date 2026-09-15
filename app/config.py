@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     qwen3_backend: str = "https://asr.example.com/s2"
     qwen3_model: str = "qwen3asr17b"
     asr_partial_interval: float = 1.0  # 草稿重推周期（秒音频），调小更跟手、请求更频
+    # 单次推理超时（秒）。与 llm_timeout 独立 —— 服务端排队时同一段音频延迟在 0.8s~60s
+    # 波动，超时过紧会整段丢字（表现：字幕时有时无）。超时/网络错误自动重试一次，4xx 不重试。
+    asr_infer_timeout: float = 60.0
     asr_chunk_size: str = "5,10,5"
     asr_language: str = "中文"  # funasr_nano 协议语种
     hotwords_path: str = "hotwords_dict.txt"

@@ -1,4 +1,9 @@
-"""FastAPI 装配：REST 控制接口 + WebSocket 广播 + 音频流水线 + 静态页面。"""
+"""FastAPI 装配：REST 控制接口 + WebSocket 广播 + 音频流水线 + 静态页面。
+
+【已封板 deprecated】本模块属 Python 版实现，自 2026-09 起不再新增功能，代码保留作
+对照与应急回退（Go 版出现疑难问题时切回来比对）。新改动只进 Go 版（go/ 目录，
+即 Dockerfile 构建的默认部署版本）。
+"""
 from __future__ import annotations
 
 import asyncio
@@ -201,6 +206,9 @@ class Runtime:
                 language=s.asr_language,
                 hotwords=hotword_list,
                 partial_interval_s=s.asr_partial_interval,
+                # 推理超时用 asr_infer_timeout 而非 llm_timeout：两者合理值不同，
+                # 且服务端排队抖动时 ASR 需要更宽的容忍度（实测 0.8s~60s）。
+                infer_timeout_s=s.asr_infer_timeout,
                 on_online=on_online,
                 on_offline=on_offline,
                 on_status=lambda st: bus.publish({"type": "ASR_STATUS", "status": st}),
@@ -742,10 +750,12 @@ async def health():
         asr_status = info["state"]
         asr_detail = info["detail"]
         asr_idle_sec = info["idle_sec"]
+        asr_infer_fail = info.get("infer_fail", 0)
     else:
         asr_status = "idle"
         asr_detail = "流水线未启动（点「开始 Session」）"
         asr_idle_sec = -1
+        asr_infer_fail = 0
     llm_status = "ok" if (s.llm_base and s.llm_model) else "not_configured"
     # 音源与浏览器收音连接状态
     mic_state = ""
@@ -756,6 +766,9 @@ async def health():
         "asr": asr_status,
         "asr_detail": asr_detail,
         "asr_idle_sec": asr_idle_sec,
+        # 连续推理失败次数：用来区分「确实没语音」与「有语音但推理一直失败」——
+        # 没有这个字段时两者都只表现为 asr_idle_sec 不断增长，从外部无法分辨。
+        "asr_infer_fail": asr_infer_fail,
         "llm": llm_status,
         "llm_model": s.llm_model or "",
         "protocol": s.asr_protocol,
@@ -865,6 +878,8 @@ async def ws_audio(websocket: WebSocket):
 @app.on_event("startup")
 async def on_startup():
     bus.bind_loop(asyncio.get_running_loop())
+    # Python 版已封板：不再新增功能，仅作对照与应急回退。生产部署请用 Go 版（Dockerfile）。
+    print("[deprecated] 注意：Python 版已封板，仅用于对照排查；生产部署请使用 Go 版。", flush=True)
 
 
 def main() -> None:

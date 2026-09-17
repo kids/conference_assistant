@@ -102,6 +102,35 @@ func Validate(text string, minChars, maxChars int) Result {
 	}
 }
 
+// ValidateSpeech 校验发言稿：只校验字数窗口与口播时长。
+//
+// 刻意不套用短翻译任务的四道铁律：
+//   - 「禁评价词」——发言稿是发言者本人的立场表达，允许表达观点；
+//   - 「必带确认句」——确认句是给"AI 翻译尝试"用的，发言稿本身就要被念出来；
+//   - 「禁 Markdown/换行」——发言稿允许多段，分段反而更好念。
+//
+// 而长度与时长必须守住：它决定现场要占用多少时间，是操作员唯一可控的量化约束。
+// 过长时先截到最后一个完整句；截断后仍超则按「过长」报错，由操作员人工处理。
+func ValidateSpeech(text string, minChars, maxChars int, maxSecs, cps float64) Result {
+	checks := make(map[string]string)
+
+	ok, msg := checkLength(text, minChars, maxChars)
+	if !ok && strings.Contains(msg, "过长") {
+		text = truncateSentence(text, maxChars)
+		ok, msg = checkLength(text, minChars, maxChars)
+	}
+	checks["len"] = msg
+
+	ok2, m2 := checkDuration(text, maxSecs, cps)
+	checks["duration"] = m2
+
+	return Result{
+		OK:     ok && ok2,
+		Checks: checks,
+		Text:   strings.TrimSpace(text),
+	}
+}
+
 // truncateSentence 截断到最后一个完整句号，仍超则硬截。
 func truncateSentence(text string, maxChars int) string {
 	r := []rune(text)

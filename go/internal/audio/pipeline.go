@@ -11,6 +11,11 @@ import (
 // preRollFrames 起句前保留的帧数：300ms / 20ms = 15 帧，避免吞掉句首。
 const preRollFrames = 15
 
+// maxSpanSeconds 单段语音最多保留的音频秒数（说话人区分用）。
+// 声纹判定用不着更长的音频，但长会议里「一句话说 15s 以上」很常见，
+// 留个上限避免异常情况下内存无界增长。
+const maxSpanSeconds = 30
+
 // Pipeline 音频主流水线：采集 → VAD 断句 → ASR 流式 → 事件总线。
 // 单 goroutine 顺序处理，帧级处理开销实测约 0.08% 实时，无需并行。
 type Pipeline struct {
@@ -19,6 +24,15 @@ type Pipeline struct {
 	asr       asr.Client
 	ring      *RingBuffer
 	serverVAD bool // true：服务端自动断句，持续透传（含静音帧）
+
+	// 说话人区分（可选）：把「一次连续说话」的音频交给 spanSink。
+	// serverVAD 为 true 时本地 VAD 不参与断句，此时用 monitor 单独监测语音边界
+	// （只做统计，不影响 ASR；webrtcvad 开销约 0.08% 实时）。
+	spanSink func(start, end float64, pcm []byte)
+	monitor  *VadSegmenter
+	spanOn   bool
+	spanFrom float64
+	spanBuf  []byte
 
 	preRoll [][]byte
 	stop    chan struct{}
@@ -39,6 +53,17 @@ func NewPipeline(capture Capture, vad *VadSegmenter, asrClient asr.Client, ring 
 		serverVAD: serverVAD,
 		stop:      make(chan struct{}),
 		done:      make(chan struct{}),
+	}
+}
+
+// SetSpanSink 启用「语音段音频」采集（供说话人区分用）。
+// monitor 非空时用它监测语音边界（serverVAD 场景：本地 VAD 不参与 ASR 断句，
+// 但仍需要「一次连续说话」的起止）；为空则复用 p.vad。
+// 回调在流水线 goroutine 内同步执行，实现方必须立即返回（不得阻塞）。
+func (p *Pipeline) SetSpanSink(monitor *VadSegmenter, sink func(start, end float64, pcm []byte)) {
+	p.spanSink = sink
+	if monitor != nil {
+		p.monitor = monitor
 	}
 }
 
@@ -110,18 +135,23 @@ func (p *Pipeline) run() {
 		}
 		emptyRun = 0
 		p.ring.Push(frame)
+		p.pushPreRoll(frame)
 
 		if p.serverVAD {
 			// 服务端自动断句：持续透传（含静音帧）
 			p.asr.SendAudio(frame)
+			if p.monitor != nil {
+				p.trackSpan(p.monitor.Process(frame), frame)
+			}
 			continue
 		}
 		if p.vad == nil {
 			continue
 		}
 
-		p.pushPreRoll(frame)
-		switch p.vad.Process(frame) {
+		ev := p.vad.Process(frame)
+		p.trackSpan(ev, frame)
+		switch ev {
 		case EventStart:
 			p.beginSegment()
 		case EventEnd:
@@ -135,6 +165,46 @@ func (p *Pipeline) run() {
 			}
 		}
 	}
+}
+
+// trackSpan 收集「一次连续说话」的音频，段尾回调 spanSink。
+// 与 ASR 断句相互独立：即使 ASR 走服务端断句（serverVAD），这里仍按本地 VAD 切段，
+// 因为说话人区分只需要「这一句是谁说的」，不需要与 ASR 的服务端语义断句完全一致。
+func (p *Pipeline) trackSpan(ev Event, frame []byte) {
+	if p.spanSink == nil {
+		return
+	}
+	switch ev {
+	case EventStart:
+		p.spanOn = true
+		p.spanFrom = nowSeconds()
+		// 回放 pre-roll（含触发 start 的那几帧），避免吞掉句首影响声纹
+		p.spanBuf = p.spanBuf[:0]
+		for _, f := range p.preRoll {
+			p.appendSpan(f)
+		}
+	case EventEnd:
+		if !p.spanOn {
+			return
+		}
+		p.spanOn = false
+		p.appendSpan(frame)
+		from, pcm := p.spanFrom, p.spanBuf
+		p.spanBuf = nil
+		p.spanSink(from, nowSeconds(), pcm)
+	case EventNone:
+		if p.spanOn {
+			p.appendSpan(frame)
+		}
+	}
+}
+
+// appendSpan 追加一帧到当前语音段，超过 maxSpanSeconds 后不再增长。
+func (p *Pipeline) appendSpan(frame []byte) {
+	if len(p.spanBuf) >= maxSpanSeconds*16000*2 {
+		return
+	}
+	p.spanBuf = append(p.spanBuf, frame...)
 }
 
 func (p *Pipeline) pushPreRoll(frame []byte) {

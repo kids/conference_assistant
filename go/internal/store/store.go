@@ -210,6 +210,45 @@ func (s *Store) ReviseSegment(segID, text string) error {
 	return err
 }
 
+// SetSegmentSpeaker 写入说话人标记（说话人区分结果，异步补写）。
+// 只写 speaker_hint，不动文本，因此可与人工修正 / LLM 顺句改写并发进行。
+func (s *Store) SetSegmentSpeaker(segID, speaker string) error {
+	_, err := s.db.Exec("UPDATE segment SET speaker_hint=? WHERE id=?", speaker, segID)
+	return err
+}
+
+// SpeakerStat 一位说话人在本场的出现统计。
+type SpeakerStat struct {
+	Speaker  string
+	Segments int
+	Seconds  float64
+}
+
+// SessionSpeakers 本场已识别出的说话人（按首次出现顺序）。
+// 数据源是 segment.speaker_hint —— 与「对齐到句子」是同一份事实，
+// 不额外维护状态，因此页面刷新/导出看到的说话人始终一致。
+func (s *Store) SessionSpeakers(sid string) ([]SpeakerStat, error) {
+	rows, err := s.db.Query(
+		`SELECT speaker_hint, COUNT(*), COALESCE(SUM(t_end - t_start), 0)
+		 FROM segment
+		 WHERE session_id=? AND speaker_hint <> ''
+		 GROUP BY speaker_hint
+		 ORDER BY MIN(seq)`, sid)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SpeakerStat
+	for rows.Next() {
+		var st SpeakerStat
+		if err := rows.Scan(&st.Speaker, &st.Segments, &st.Seconds); err != nil {
+			return nil, err
+		}
+		out = append(out, st)
+	}
+	return out, rows.Err()
+}
+
 // RecentSegments 最近转写：seconds>0 时按时间窗，否则取最近 limit 条（升序返回）。
 func (s *Store) RecentSegments(sid string, seconds float64, limit int) ([]Segment, error) {
 	var (
@@ -250,9 +289,9 @@ func scanSegments(rows *sql.Rows) ([]Segment, error) {
 	var out []Segment
 	for rows.Next() {
 		var (
-			s        Segment
-			revised  sql.NullString
-			isFinal  int
+			s       Segment
+			revised sql.NullString
+			isFinal int
 		)
 		if err := rows.Scan(&s.ID, &s.SessionID, &s.Seq, &s.TStart, &s.TEnd, &s.Track,
 			&s.SpeakerHint, &s.Text, &revised, &isFinal); err != nil {

@@ -29,6 +29,9 @@
   #subtitleArea{height:26%;border-top:1px solid #1c2128;padding:18px 28px;display:flex;flex-direction:column;justify-content:flex-end;overflow:hidden}
   .subline{font-size:22px;line-height:1.5;color:var(--txt);margin-bottom:6px}
   .subline.draft{color:#6b7682;font-style:italic}
+  /* 说话人标记：换人时缩进并加一条竖线，观众一眼看出换人（与操作台口径一致） */
+  .subline .spk{color:var(--blue);font-size:17px;margin-right:12px}
+  .subline.new-speaker{margin-top:10px;padding-left:14px;border-left:3px solid #2b3a4d}
 </style>
 </head>
 <body>
@@ -53,7 +56,10 @@ const $=id=>document.getElementById(id);
 // 页面固定是 <前缀>/screen，从 pathname 反推前缀 —— 根路径部署时为空串。
 const BASE=location.pathname.replace(/\/(console|screen)\/?$/,"").replace(/\/+$/,"");
 let ws, start=Date.now(), aiTimer=null, lastState="IDLE";
-const TASK_LABEL={TERM:"术语翻译",Q_TRANSLATE:"问题转译",A_TRANSLATE:"回答转译",BRIDGE:"桥接提问",SUMMARY:"报告总结"};
+const TASK_LABEL={TERM:"术语翻译",Q_TRANSLATE:"问题转译",A_TRANSLATE:"回答转译",BRIDGE:"桥接提问",SUMMARY:"报告总结",SPEECH:"发言稿"};
+// 角标：发言稿是「AI 起草、供发言人本人使用」，与「AI 翻译尝试」不是一回事，必须区分
+const WATERMARK_TRANSLATE="AI 跨学科翻译尝试 · 待报告人确认";
+const WATERMARK_SPEECH="AI 起草发言稿 · 供发言人修改使用";
 
 function connect(){
   // 协议自适应（页面走 https 时必须 wss）+ 带上路径前缀
@@ -68,27 +74,43 @@ function handle(m){
     case "TRANSCRIPT_PARTIAL": addSub(m.text,true); break;
     case "TRANSCRIPT_FINAL": addSub(m.text,false,m.seg_id); break;
     case "TRANSCRIPT_REVISED": reviseSub(m.seg_id,m.text); break;
+    case "SPEAKER_ASSIGNED": markSubSpeaker(m.seg_id,m.label||m.speaker); break;
     case "AI_STATE":
+      // 发言稿的生成过程不占大屏：只在操作员点「投屏」时才通过 AI_SHOWING 上来
+      if(m.task==="SPEECH") break;
       if(m.state==="GENERATING"){ window.__cur=""; setLamp("generating","生成中"); $("aiCard").classList.remove("visible"); }
       // IDLE 也要下屏：丢弃/生成失败都会发 IDLE，此前只改状态灯会让卡片继续留在屏上
       else if(m.state==="IDLE"){ setLamp("listening","静默听会"); clearTimeout(aiTimer); $("aiCard").classList.remove("visible"); }
       else if(m.state==="PENDING_APPROVAL"){ setLamp("generating","待确认"); }
       break;
-    case "AI_DELTA": /* 实时拼接暂存 */ window.__cur=(window.__cur||"")+m.delta; break;
-    case "AI_READY": window.__cur=m.text; break;
+    case "AI_DELTA": /* 实时拼接暂存 */ if(m.task!=="SPEECH") window.__cur=(window.__cur||"")+m.delta; break;
+    case "AI_READY": if(m.task!=="SPEECH") window.__cur=m.text; break;
     case "AI_SHOWING":
       const text=m.text||window.__cur||"";
       $("aiText").textContent=text;
       $("badge").textContent=TASK_LABEL[m.task]||"AI 翻译";
+      $("watermark").textContent=(m.task==="SPEECH")?WATERMARK_SPEECH:WATERMARK_TRANSLATE;
       $("aiCard").classList.add("visible");
       setLamp("showing","展示中");
       clearTimeout(aiTimer);
-      aiTimer=setTimeout(()=>{ $("aiCard").classList.remove("visible"); setLamp("listening","静默听会"); }, 30000);
+      // 发言稿是给人念的，留屏时间给足（默认 2 分钟，可用 TASK_LABEL 外的场景微调）
+      aiTimer=setTimeout(()=>{ $("aiCard").classList.remove("visible"); setLamp("listening","静默听会"); }, (m.task==="SPEECH")?120000:30000);
       break;
     case "AI_KILLED":
       $("aiCard").classList.remove("visible"); setLamp("listening","静默听会"); clearTimeout(aiTimer);
       break;
   }
+}
+// 说话人标记迟到（先出字幕、后判说话人）：补到对应字幕行上；已滚出屏幕的行忽略。
+// 与上一条不同人时加竖线缩进，形成"换行 + 标记"的视觉分段。
+function markSubSpeaker(segId,label){
+  const el=document.getElementById("sub-"+segId);
+  if(!el||!label||el.querySelector(".spk")) return;
+  el.dataset.spk=label;
+  el.insertAdjacentHTML("afterbegin",`<span class="spk">${label}</span>`);
+  const prev=el.previousElementSibling;
+  if(prev&&prev.dataset.spk&&prev.dataset.spk===label) el.classList.remove("new-speaker");
+  else el.classList.add("new-speaker");
 }
 function addSub(text,draft,segId){
   const area=$("subtitleArea");

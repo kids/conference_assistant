@@ -15,6 +15,7 @@ import (
 	"seat/internal/audio"
 	"seat/internal/config"
 	"seat/internal/contextx"
+	"seat/internal/diarize"
 	"seat/internal/events"
 	"seat/internal/state"
 	"seat/internal/store"
@@ -63,6 +64,14 @@ type Runtime struct {
 	// 目标学科：把 AI 输出调整到该学科的表达层次。默认「白话」=非专业听众也能听懂。
 	// 与 session.discipline（报告人学科，仅用于热词生成）是两个不同概念。
 	targetDiscipline string
+
+	// 说话人区分（CAM++ sidecar）：diarizer 为 nil 表示未启用。
+	// spkCh/spkStop 由 startDiarize 懒创建；spk 见 diarize.go。
+	diarizer *diarize.Client
+	spkCh    chan spanJob
+	spkStop  chan struct{}
+	spkOnce  sync.Once
+	spk      spkState
 }
 
 // DefaultTargetDiscipline 默认目标学科。
@@ -88,6 +97,14 @@ func NewRuntime(s *config.Settings) (*Runtime, error) {
 		hotwordsEnabled:  true,
 		roundSegs:        map[string]string{},
 		targetDiscipline: DefaultTargetDiscipline,
+	}
+	if s.DiarizeEnabled {
+		rt.diarizer = diarize.New(s.DiarizeURL, s.DiarizeTimeout, s.DiarizeThreshold, s.DiarizeMinMS)
+		rt.spkCh = make(chan spanJob, spanQueue)
+		rt.spkStop = make(chan struct{})
+		log.Printf("[diarize] 说话人区分已启用：%s（阈值 %.2f，最短 %dms，自动拉起 %v）",
+			s.DiarizeURL, s.DiarizeThreshold, s.DiarizeMinMS, s.DiarizeAutostart)
+		rt.startDiarize()
 	}
 	return rt, nil
 }
@@ -117,6 +134,9 @@ func (rt *Runtime) SetTargetDiscipline(v string) string {
 // Close 释放运行时资源。
 func (rt *Runtime) Close() {
 	rt.StopPipeline()
+	if rt.spkStop != nil {
+		close(rt.spkStop)
+	}
 	rt.Store.Close()
 	contextx.CloseTerms()
 }
@@ -235,6 +255,10 @@ func (rt *Runtime) makeHandlers() asr.Handlers {
 				"type": "TRANSCRIPT_FINAL", "seg_id": segID, "text": text,
 				"t_start": tStart, "t_end": tEnd,
 			})
+
+			// 说话人区分：登记这一句，等 CAM++ 结果到达后按时间对齐回填
+			// （先显示字幕、后补说话人标记，不拖慢转写）
+			rt.noteSegment(segID, tStart, tEnd)
 
 			glossary := rt.currentGlossary()
 			if items := contextx.ScoreText(text, glossary); len(items) > 0 {
@@ -365,6 +389,24 @@ func (rt *Runtime) StartPipeline(replayPath, captureMode string) (map[string]any
 
 	pipeline := audio.NewPipeline(capture, vad, asrClient, rt.ring, serverVAD)
 
+	// 说话人区分：需要「一次连续说话」的音频与边界。
+	// serverVAD 模式下本地 VAD 不参与断句，这里另建一个只做监测的 VAD
+	// （webrtcvad 开销约 0.08% 实时，不影响音频链路）。
+	if rt.diarizer != nil {
+		monitor := vad
+		if monitor == nil {
+			if v, err := audio.NewVadSegmenter(s.SampleRate, s.FrameMS, s.VADSilenceMS,
+				s.VADAggressiveness, s.MaxSegmentS); err == nil {
+				monitor = v
+			} else {
+				log.Printf("[diarize] 监测 VAD 初始化失败，本场不产出说话人标记: %v", err)
+			}
+		}
+		if monitor != nil {
+			pipeline.SetSpanSink(monitor, rt.onSpan)
+		}
+	}
+
 	rt.mu.Lock()
 	rt.capture = capture
 	rt.captureMode = mode
@@ -467,6 +509,9 @@ func (rt *Runtime) CreateSession(title, speaker, institution, discipline string,
 	if err := mkdirAll(materialsDir); err != nil {
 		return nil, serverError("创建会话目录失败: %v", err)
 	}
+
+	// 说话人区分：新 session 从零开始编号（sidecar 里若存着同 id 的旧状态也一并清掉）
+	rt.resetDiarize(sid)
 
 	rt.mu.Lock()
 	rt.sessionID = sid

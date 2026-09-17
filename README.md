@@ -4,6 +4,11 @@
 
 对应需求文档：《Workshop_AI跨学科实时翻译席技术方案》；架构设计见 `../架构设计_AI跨学科实时翻译席.md`。
 
+除 5 个投屏翻译任务外，同一套页面还提供两项现场能力：
+
+- **说话人区分**：CAM++ sidecar 逐句判定说话人，控制台/大屏在句子上方标注「说话人 N」，换人处画分隔线（见下文「说话人区分」）；
+- **发言**：中栏填「立场」+ 选语言/长度 → 结合会议上下文生成发言稿，展示在右下角（见下文「发言」）。
+
 ## 两种实现
 
 本仓库有两套**功能等价、接口兼容**的实现：
@@ -71,6 +76,74 @@ Go 版有 4 个 cgo 依赖，需要 `gcc` / `g++`：
 3. **读空闲超时 3 分钟**。Python 版底层 `websocket-client` 的 socket 超时为 10s，静默连接会被误判断开。
 4. **中文分词边界个别句子不同**：gojieba 与 Python jieba 同源但非逐字一致，实测 10 句样本中 6 句完全相同；差异处各有得失（`带隙`/`隧穿` 被合并成词反而多识别出术语，`X射线` 被拆开少识别一个），净效果基本中性。
 5. `GET /api/devices` 改用 malgo 枚举，返回字段与 Python 版的 sounddevice 不同（仅调试接口）。
+6. **前端页面已分叉**：`go/web/` 比 `app/web/` 多出「说话人标记」与「发言/发言稿」两块（Python 版已封板，不再跟进）。
+   两者的 DOM 引用仍由 `go/web_assets_test.go` 一并守住（该测试会把 `app/web` 也扫一遍）。
+
+## 说话人区分（CAM++ sidecar）
+
+一句话里"换人了"在字幕上是看不出来的。本功能给每句转写补一个说话人标记：
+同一 session 内编号稳定（S1/S2/…），控制台左栏与大屏字幕在该句上方显示「说话人 N」，
+换人处画一条分隔线（控制台虚线 + 缩进，大屏左侧竖线）。
+
+- **怎么做**：主程序（Go）把「一次连续说话」的音频（本地 VAD 切段，带起止时间）丢给 sidecar；
+  sidecar 用 CAM++ 提 192 维声纹，与本场已有说话人中心做余弦比对（阈值 `DIARIZE_THRESHOLD`），
+  低于阈值就新建一位说话人，高于阈值则并入并把该段音频按长度加权进中心。
+  判定结果回来后再与已落库的句子按时间对齐，回填 `segment.speaker_hint` 并推 `SPEAKER_ASSIGNED`。
+- **为什么是 sidecar**：CAM++ 要 PyTorch，而主程序是 Go（cgo 只带了 VAD/分词/SQLite）；
+  依赖体积也不适合进主镜像，因此交给 `tools/diarize/` 在**运行时**装依赖、下模型。
+- **异步、可缺失**：判定与转写解耦（有界队列 + 丢弃），sidecar 慢/挂都不会阻塞音频链路；
+  拿不准的句子宁可不标（超时未配对的条目 120s 后丢弃），也不会标错人。
+- **同一 session 内对齐**：说话人表持久化在 `sessions/<sid>/speakers.json`，
+  sidecar 重启后重连同一场次，编号仍从 S1 续上；新开 session 自动重置。
+
+启动 sidecar（首次会自动建 venv、装依赖、下模型，约 200MB + 28MB，之后启动 2~4s）：
+
+```bash
+# 方式一：由主程序自动拉起（.env 里 DIARIZE_ENABLED=true，URL 指向本机时默认开）
+# 方式二：手动（推荐首次先手动跑一遍，能直接看到安装与加载日志）
+bash tools/diarize/run.sh --port 18901
+
+# 没有 Python 环境 / 只想验证链路是否通：mock 模式（不做真实声纹，仅按固定规则分组）
+python3 tools/diarize/server.py --mock --port 18901
+```
+
+`.env` 配置：
+
+```bash
+DIARIZE_ENABLED=false      # 打开开关
+DIARIZE_URL=http://127.0.0.1:18901
+DIARIZE_THRESHOLD=0.5      # 同人判定阈值：同一个人被拆成多个编号→调小；不同人并成一个→调大
+DIARIZE_MIN_MS=600         # 过短语音段不判定
+DIARIZE_TIMEOUT=20
+DIARIZE_AUTOSTART=true     # 不可达时自动执行 run.sh（仅本机 URL）
+```
+
+页脚 `说话人:` 会显示三种状态：`未启用`（配置关闭）/ `区分中（已标 N 句）` / `sidecar 不可达`。
+sidecar 侧日志在主程序数据目录下（`sessions/diarize.log`，由自动拉起时重定向），每次判定一行（含相似度）；
+排查「编号乱跳 / 句子没标记」时再打开 `DIARIZE_DEBUG=true`，会打印每段语音的判定结果与句子配对决策。
+
+**对齐规则**（`internal/server/diarize.go`，实测踩过的坑都写在常量注释里）：
+
+- 语音段与句子按时间配对：**有重叠优先**（本地 VAD 模式即此情形），无重叠时允许「接近」（服务端断句会晚几秒）；
+- 一句话如果与某段音频只有"擦边"或"接近"的关系，会先**等一会儿**（`settleAfter`）：真正对应的那段音频的
+  判定结果往往还差一两秒，急着配会把它配给上一段并顺着继承污染后面的句子；
+- 同一段连续说话被 ASR 拆成多句时**继承**该段说话人（要求实打实的重叠，且重叠占该句估计时长的
+  `inheritMinContain` 以上），因此"一段话里三句只有第一句有标记"这种情况不会出现；
+- 超时未配对的条目 120s 后丢弃：宁可不标，也不标错。
+
+## 发言（按立场生成发言稿）
+
+给与会者自己用的能力：**填立场 → 结合现场上下文生成一段可朗读的发言稿**，
+展示在控制台**右下角**（与右上「AI 输出卡」完全独立，生成过程不会清掉大屏上的卡片）。
+
+- 中栏底部填写：**立场**（必填）、**语言**（中文/English/中英双语）、**长度**（约 30 秒 / 1 分钟 / 2 分钟）、
+  补充要求（可选，如「面向政府听众」）；点「发言」（或在立场框按 `Ctrl/Cmd+Enter`）。
+- 后端走 `task=SPEECH` 的独立提示词（`agent.SpeechSystemPrompt`）：允许表达立场与分段，
+  但同样禁止编造会议中未出现的数据/结论；`LLM_MAX_TOKENS` 不够用，单独用 `SPEECH_MAX_TOKENS`（默认 6000）。
+- 校验只卡两件事：字数窗口与口播时长（窗口与语言/长度档位一一对应，由 `GET /api/speech/options` 下发到页面，
+  避免"提示词按 2 分钟、校验按 30 秒"的口径漂移）；不再强制"必须请求确认"「禁评价词」那套短任务铁律。
+- 右下角的稿子可直接编辑（失焦保存）、**重生成**、**复制**、**投屏**。
+  投到大屏时角标会变成「AI 起草发言稿 · 供发言人修改使用」，留屏 2 分钟（翻译任务是 30 秒）。
 
 ## 快速开始（Python 版，已封板）
 
@@ -131,6 +204,16 @@ curl -X POST http://127.0.0.1:8080/api/session \
 `mockasr` 按累积数组返回 `sentences`（与真实 FunASR-Nano 服务端行为一致），因此可用于回归
 「新句 / 服务端回退修正」这两条分支。
 
+若同时要离线验证**说话人区分**链路，再起一个 mock sidecar（不加载模型，按音频统计量分组）：
+
+```bash
+# 终端 3：假说话人 sidecar
+python3 tools/diarize/server.py --mock --port 18901
+
+# 启动主程序时打开开关（AUTOSTART 关掉，避免它去装真依赖）
+DIARIZE_ENABLED=true DIARIZE_AUTOSTART=false ./seat
+```
+
 ## 远端部署与浏览器收音
 
 部署在服务器（无本地麦克风）时，可用**浏览器收音**：任意机器上的浏览器采集 16k PCM，经 WebSocket 推给服务进入 ASR 流水线。
@@ -174,6 +257,14 @@ python tools/check_env.py        # Python 版
 | `LLM_TIMEOUT` | 单次调用超时。**注意**：`hy3` 是思考模型，长 prompt（如热词生成）思考需 28~37s，该值偏小会导致随机超时；热词生成已在代码内单独给 90s |
 | `LLM_MAX_TOKENS` | 生成预算。`hy3` 的 `reasoning_content` 与正文**共享**该预算，过小会导致正文为空 |
 | `LLM_CHAT_PATH` | 端点后缀，taiji 留空；标准 OpenAI 服务填 `/v1/chat/completions` |
+| `SPEECH_MAX_TOKENS` | 「发言」的单次生成预算（默认 6000）。发言稿最长 2 分钟，比短翻译长得多 |
+| `DIARIZE_ENABLED` | 是否开启说话人区分（默认 false）。开启需要 Python 环境跑 CAM++ sidecar |
+| `DIARIZE_URL` | sidecar 地址，默认 `http://127.0.0.1:18901` |
+| `DIARIZE_THRESHOLD` | 同一说话人判定阈值（余弦，默认 0.5）：同人被拆开→调小，不同人并一起→调大 |
+| `DIARIZE_MIN_MS` | 过短的语音段不做判定（默认 600ms） |
+| `DIARIZE_TIMEOUT` | 单段声纹判定超时（秒，默认 20） |
+| `DIARIZE_AUTOSTART` | sidecar 不可达时自动执行 `tools/diarize/run.sh`（默认 true，仅本机 URL） |
+| `DIARIZE_DEBUG` | 打印每段语音的判定与配对决策（默认 false，排查编号乱跳时打开） |
 | `HOTWORDS_PATH` | 全局热词兜底（可留空，会前按科学家自动生成 session 专属热词） |
 
 ### 科学家热词自动生成
@@ -207,12 +298,14 @@ python tools/check_env.py        # Python 版
 
 ```
 app/            Python 版（FastAPI：audio 采集/断句、asr 流式、context、agent、providers）—— 已封板
-app/web/        console.html / screen.html（零框架原生前端）
-go/             Go 版（internal/{config,events,state,store,llm,asr,audio,contextx,agent,server}）
-go/web/         与 app/web/ 逐字一致，编译时 embed 进二进制
+app/web/        console.html / screen.html（零框架原生前端，已封板不再跟进新功能）
+go/             Go 版（internal/{config,events,state,store,llm,asr,audio,contextx,agent,diarize,server}）
+go/web/         在 app/web/ 基础上多了「说话人标记」与「发言/发言稿」，编译时 embed 进二进制
 go/tools/mockasr  本地假 ASR 服务（离线验证整条流水线）
 Dockerfile      Go 版镜像（默认）
 Dockerfile.python  Python 版镜像（已封板，仅对照用）
-sessions/       运行数据（SQLite 转写库、session 资料、复盘导出）
+sessions/       运行数据（SQLite 转写库、session 资料、复盘导出、
+                <sid>/speakers.json 说话人表、diarize.log sidecar 日志）
 tools/          check_env.py 环境自检（Python 版）
+tools/diarize/  CAM++ 说话人区分 sidecar（run.sh 运行时装依赖+下模型；server.py 可 --mock 联调）
 ```

@@ -14,9 +14,12 @@ import (
 )
 
 // screenTypes 大屏只接收这些事件（对齐 Python 版 _SCREEN_TYPES）。
+// 注意：新增事件若要上大屏，必须加进这张表 —— 漏加的表现是"后端发了、页面没反应"，
+// 从页面侧完全看不出原因（translation_seat 的 Go/Python 两版都以本表为准）。
 var screenTypes = map[string]struct{}{
 	"TRANSCRIPT_PARTIAL": {}, "TRANSCRIPT_FINAL": {}, "TRANSCRIPT_REVISED": {},
-	"AI_STATE": {}, "AI_DELTA": {}, "AI_READY": {}, "AI_SHOWING": {}, "AI_DONE": {},
+	"SPEAKER_ASSIGNED": {},
+	"AI_STATE":         {}, "AI_DELTA": {}, "AI_READY": {}, "AI_SHOWING": {}, "AI_DONE": {},
 	"AI_KILLED": {}, "HEALTH": {}, "SNAPSHOT": {}, "SESSION": {},
 }
 
@@ -80,6 +83,8 @@ func (s *Server) routes() *http.ServeMux {
 	mux.HandleFunc("GET /api/target-discipline", s.handleGetTargetDiscipline)
 	mux.HandleFunc("POST /api/target-discipline", s.handleSetTargetDiscipline)
 	mux.HandleFunc("GET /api/devices", s.handleDevices)
+	mux.HandleFunc("GET /api/speech/options", s.handleSpeechOptions)
+	mux.HandleFunc("GET /api/speakers", s.handleSpeakers)
 	mux.HandleFunc("POST /api/invoke", s.handleInvoke)
 	mux.HandleFunc("POST /api/invocation/{iid}/show", s.handleShow)
 	mux.HandleFunc("PATCH /api/invocation/{iid}", s.handleReviseInvocation)

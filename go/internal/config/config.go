@@ -60,6 +60,24 @@ type Settings struct {
 	// 22MB→31s，120s 余量偏紧（网络慢或服务端排队时会误报「不可达」）。
 	DocParseTimeout float64
 
+	// 说话人区分（CAM++ sidecar）
+	DiarizeEnabled   bool
+	DiarizeURL       string
+	DiarizeTimeout   float64
+	DiarizeThreshold float64
+	DiarizeMinMS     int
+	// DiarizeAutostart 启动时自动拉起 sidecar（tools/diarize/run.sh，首次运行会装依赖+下模型）。
+	// 仅在 DiarizeURL 指向本机、且脚本存在时生效；起不来只记日志，不影响转写。
+	DiarizeAutostart bool
+	// DiarizeDebug 打印「每段语音的判定结果」与「句子-语音段的配对决策」。
+	// 现场排查「编号乱跳 / 标记缺失」时打开：能直接看到某句话被配给了哪一段音频、为什么。
+	DiarizeDebug bool
+
+	// 发言（按立场生成发言稿）
+	// SpeechMaxTokens 「发言」单次生成预算。hy3 的思考与正文共享该预算，
+	// 2 分钟发言稿正文可达 600 字，预算过小会出现「正文为空」。
+	SpeechMaxTokens int
+
 	// 音频
 	SampleRate        int
 	FrameMS           int
@@ -124,6 +142,17 @@ func Load() *Settings {
 		DocMaxBytes: envInt("DOC_MAX_BYTES", 256<<20),
 		// 解析超时：给大文件与慢链路留余量（原硬编码 120s，22MB 已耗 31s，余量偏紧）
 		DocParseTimeout: envFloat("DOC_PARSE_TIMEOUT", 180.0),
+
+		// 说话人区分：默认关闭（需要 Python 环境跑 CAM++ sidecar），见 .env.example 说明
+		DiarizeEnabled:   envBool("DIARIZE_ENABLED", false),
+		DiarizeURL:       envStr("DIARIZE_URL", "http://127.0.0.1:18901"),
+		DiarizeTimeout:   envFloat("DIARIZE_TIMEOUT", 20.0),
+		DiarizeThreshold: envFloat("DIARIZE_THRESHOLD", 0.5),
+		DiarizeMinMS:     envInt("DIARIZE_MIN_MS", 600),
+		DiarizeAutostart: envBool("DIARIZE_AUTOSTART", true),
+		DiarizeDebug:     envBool("DIARIZE_DEBUG", false),
+
+		SpeechMaxTokens: envInt("SPEECH_MAX_TOKENS", 6000),
 
 		SampleRate:        envInt("SAMPLE_RATE", 16000),
 		FrameMS:           envInt("FRAME_MS", 20),

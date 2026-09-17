@@ -23,7 +23,8 @@
   .col h2{font-size:13px;color:var(--dim);padding:10px 14px;border-bottom:1px solid var(--line);flex:0 0 auto;text-transform:uppercase;letter-spacing:.05em}
   .scroll{flex:1;overflow-y:auto;padding:10px 12px}
   /* 转写 */
-  .seg{padding:6px 8px;border-radius:6px;margin-bottom:6px;font-size:14px;line-height:1.55;cursor:text}
+  .segwrap{margin-bottom:6px}
+  .seg{padding:6px 8px;border-radius:6px;font-size:14px;line-height:1.55;cursor:text}
   .seg.partial{color:var(--dim);font-style:italic}
   .seg.final{color:var(--txt);background:#22262e}
   .seg .t{color:#5b6270;font-size:11px;margin-right:6px;font-family:monospace}
@@ -31,6 +32,17 @@
   /* 修正高亮：asr 回退纠错=黄，llm 顺句改写=蓝，1.5s 后淡出 */
   .seg.revised-asr{background:#3a3116;transition:background .6s}
   .seg.revised-llm{background:#16283a;transition:background .6s}
+  /* 说话人区分：标记在句子之上；换人时用分隔线断开，扫一眼就知道换人了。
+     标记放在可编辑文本之外（.segwrap 内、.seg 外），避免人工改字时把标记也写进转写。 */
+  .segwrap .spk{display:none}
+  .segwrap.has-spk .spk{display:inline-block;font-size:11px;line-height:1.5;padding:1px 8px;border-radius:9px;background:#2a3446;color:#a8c0e8;margin-bottom:4px}
+  .segwrap[data-spk="S1"] .spk{background:#20342a;color:#8fd6a4}
+  .segwrap[data-spk="S2"] .spk{background:#2a3446;color:#a8c0e8}
+  .segwrap[data-spk="S3"] .spk{background:#382d20;color:#e0b98f}
+  .segwrap[data-spk="S4"] .spk{background:#36222f;color:#dca6d6}
+  .segwrap[data-spk="S5"] .spk{background:#22323a;color:#8fd2e0}
+  .segwrap[data-spk="S6"] .spk{background:#33304a;color:#b9b2ef}
+  .segwrap.new-speaker{margin-top:14px;border-top:1px dashed var(--line);padding-top:10px}
   /* 术语 */
   .term{padding:6px 9px;background:#262b34;border-radius:6px;margin-bottom:6px;cursor:pointer;font-size:13px;display:flex;justify-content:space-between}
   .term:hover{border:1px solid var(--accent)}
@@ -47,6 +59,22 @@
   #aiCard[contenteditable="true"]:focus{outline:1px solid var(--accent);border-color:var(--accent)}
   .checks{font-size:11px;color:var(--dim);margin-top:8px;font-family:monospace}
   .actions{display:flex;gap:8px;margin-top:10px}
+  /* 中栏底部：发言（立场 → 发言稿） */
+  .formbar{flex:0 0 auto;border-top:1px solid var(--line);padding:10px 12px;background:#191c22}
+  .formbar .row{display:flex;gap:6px;margin-top:8px;align-items:center}
+  .formbar select{background:#14161a;border:1px solid var(--line);color:var(--txt);border-radius:6px;padding:6px 8px;font-size:12px;flex:1;min-width:0}
+  textarea#stance,textarea#spExtra{width:100%;background:#14161a;border:1px solid var(--line);color:var(--txt);border-radius:6px;padding:8px 10px;font-size:13px;font-family:inherit;line-height:1.5;resize:vertical}
+  textarea#spExtra{margin-top:6px}
+  .formbar button{padding:7px 12px}
+  /* 右栏底部：发言稿展示区 */
+  #speechPane{flex:0 0 auto;display:flex;flex-direction:column;border-top:1px solid var(--line);min-height:130px;max-height:42%}
+  #speechPane .panehead{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--line);flex:0 0 auto}
+  #speechPane .panehead h2{font-size:13px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em;padding:0;border:none;flex:0 0 auto}
+  #speechPane .panehead button{padding:4px 10px;font-size:12px}
+  #speechMeta{font-size:11px;color:var(--dim);font-family:monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #speechCard{flex:1;overflow-y:auto;padding:10px 12px;font-size:14px;line-height:1.75;white-space:pre-wrap;color:var(--txt);cursor:text}
+  #speechCard .state{color:var(--dim);font-style:italic}
+  #speechCard[contenteditable="true"]:focus{outline:1px solid var(--accent);border-radius:6px}
   footer{height:34px;display:flex;align-items:center;gap:14px;padding:0 16px;border-top:1px solid var(--line);font-size:12px;color:var(--dim);flex:0 0 auto}
   .capcheck{display:flex;align-items:center;gap:5px;font-size:12px;color:var(--dim);cursor:pointer;white-space:nowrap}
   .capcheck input{cursor:pointer}
@@ -87,6 +115,23 @@
       <h2 style="padding:6px 0 8px;border:none">候选术语（点击即解释）</h2>
       <div id="terms"></div>
     </div>
+    <!-- 发言：填立场 + 选语言/长度 → 生成发言稿（展示在右下角，可投屏） -->
+    <div class="formbar">
+      <textarea id="stance" rows="3" placeholder="立场：发言要服务于什么观点？（例：我来自电池材料方向，关心固态电解质的界面稳定性，希望找到可合作的表征手段）"></textarea>
+      <textarea id="spExtra" rows="1" placeholder="补充要求（可选）：如「面向政府听众」「欢迎质疑」「希望提到报告里的具体数据」"></textarea>
+      <div class="row">
+        <!-- 选项由 /api/speech/options 覆盖（后端是字数窗口的唯一出处），下面只是兜底 -->
+        <select id="spLang" title="发言稿语言">
+          <option value="中文">中文</option><option value="English">English</option><option value="中英双语">中英双语</option>
+        </select>
+        <select id="spLen" title="发言稿长度（现场口播时长，决定字数窗口）">
+          <option value="short">约 30 秒（90~165 字）</option>
+          <option value="medium" selected>约 1 分钟（180~330 字）</option>
+          <option value="long">约 2 分钟（360~660 字）</option>
+        </select>
+        <button id="btnSpeech" class="primary" title="根据立场与会议上下文生成发言稿（结果显示在右下角；也可在立场框按 Ctrl/Cmd+Enter）">发言</button>
+      </div>
+    </div>
   </div>
   <div class="col">
     <h2>AI 输出卡</h2>
@@ -109,12 +154,25 @@
         <span id="hwStatus" style="font-size:12px;color:var(--dim)"></span>
       </div>
     </div>
+    <!-- 右下：发言稿展示区（内容可编辑，失焦即保存；投屏到大屏后可现场念） -->
+    <div id="speechPane">
+      <div class="panehead">
+        <h2>发言稿</h2>
+        <span id="speechMeta"></span>
+        <span class="sp"></span>
+        <button id="btnSpeechRegen" title="按同样的立场与要求重新生成一版">重生成</button>
+        <button id="btnSpeechShow" title="把发言稿投到大屏（大屏角标会标注为 AI 起草）">投屏</button>
+        <button id="btnSpeechCopy" title="复制发言稿全文">复制</button>
+      </div>
+      <div id="speechCard"><span class="state">在中间栏填写「立场」并点「发言」，生成的发言稿会显示在这里。</span></div>
+    </div>
   </div>
 </main>
 <footer>
   <span id="asrStatus">ASR: -</span>
   <span id="llmStatus">LLM: -</span>
   <span id="micStatus">收音: -</span>
+  <span id="spkStatus">说话人: -</span>
   <span id="sessionInfo">未开始</span>
   <span class="sp"></span>
   <span id="callCount">调用 0 次</span>
@@ -127,6 +185,9 @@ const $=id=>document.getElementById(id);
 // 解析成 /api/x（前缀丢失），即使 Kong 配了 strip_path 也回不到后端。
 const BASE=location.pathname.replace(/\/(console|screen)\/?$/,"").replace(/\/+$/,"");
 let ws, sid=null, curInv=null, curTask=null, curText="", callCount=0;
+// 发言稿（右下角展示区）与 AI 输出卡是两条独立通道：分别记住各自的 invocation
+let speechInv=null, speechText="", speechReq=null;
+function escapeHtml(s){ return String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 // 未捕获异常不再静默：底部横幅提示（元素缺失/接口报错都会立刻可见）
 window.onerror=(msg,src,line)=>{ const b=$("errBar"); if(b){ b.style.display=""; b.textContent="页面脚本错误："+msg+"（第 "+line+" 行）— 请截图反馈"; } return false; };
 
@@ -149,17 +210,39 @@ function handle(m){
     case "TRANSCRIPT_FINAL": finalSeg(m.seg_id,m.text); break;
     case "TRANSCRIPT_REVISED": reviseSeg(m.seg_id,m.text,m.source); break;
     case "TERM_CANDIDATES": renderTerms(m.items); break;
+    case "SPEAKER_ASSIGNED": markSpeaker(m.seg_id,m.speaker,m.label); loadSpeakers(); break;
     case "AI_STATE":
+      // 「发言」走独立通道：只更新右下角发言稿区，不碰 AI 输出卡与顶栏状态
+      // （发言稿是给发言者本人念的，不是投屏用的跨学科翻译尝试）
+      if(m.task==="SPEECH"){
+        if(m.state==="GENERATING"){ speechInv=m.invocation_id; speechText=""; $("speechCard").innerHTML="<span class='state'>生成中…</span>"; $("speechCard").contentEditable="false"; $("speechMeta").textContent=""; }
+        else if(m.state==="IDLE" && m.error){
+          let html=`<span style="color:var(--red)">${m.error}</span>`;
+          if(m.raw_text){ html+=`<div style="margin-top:10px;color:var(--dim);font-size:13px">模型原文（未通过校验，请人工判断）：</div><div style="margin-top:4px">${escapeHtml(m.raw_text)}</div>`; }
+          $("speechCard").innerHTML=html; $("speechCard").contentEditable="false";
+        }
+        break;
+      }
       $("stateLabel").textContent=m.state;
       if(m.state==="GENERATING"){ curInv=m.invocation_id; curTask=m.task; curText=""; $("aiCard").innerHTML="<span class='state'>生成中…</span>"; $("aiCard").contentEditable="false"; $("checks").textContent=""; }
       if(m.state==="IDLE" && m.error){
-        let html=`<span style="color:var(--red)">${m.error}</span>`;
-        if(m.raw_text){ html+=`<div style="margin-top:10px;color:var(--dim);font-size:13px">模型原文（未通过校验，请人工判断）：</div><div style="margin-top:4px">${m.raw_text}</div>`; }
+        let html=`<span style="color:var(--red)">${escapeHtml(m.error)}</span>`;
+        if(m.raw_text){ html+=`<div style="margin-top:10px;color:var(--dim);font-size:13px">模型原文（未通过校验，请人工判断）：</div><div style="margin-top:4px">${escapeHtml(m.raw_text)}</div>`; }
         $("aiCard").innerHTML=html; $("aiCard").contentEditable="false";
       }
       break;
-    case "AI_DELTA": if(m.invocation_id===curInv){ curText+=m.delta; $("aiCard").textContent=curText; } break;
+    case "AI_DELTA":
+      if(m.invocation_id===speechInv){ speechText+=m.delta; $("speechCard").textContent=speechText; $("speechCard").scrollTop=$("speechCard").scrollHeight; }
+      else if(m.invocation_id===curInv){ curText+=m.delta; $("aiCard").textContent=curText; }
+      break;
     case "AI_READY":
+      if(m.task==="SPEECH" || m.invocation_id===speechInv){
+        speechInv=m.invocation_id; speechText=m.text;
+        $("speechCard").textContent=m.text;
+        $("speechCard").contentEditable="true"; $("speechCard").dataset.text=m.text;  // 允许人工编辑（失焦保存）
+        $("speechMeta").textContent="字数="+m.chars+" 约"+m.est_sec+"s | "+JSON.stringify(m.checks);
+        break;
+      }
       curInv=m.invocation_id; curText=m.text; curTask=m.task;
       $("aiCard").textContent=m.text;
       $("aiCard").contentEditable="true"; $("aiCard").dataset.text=m.text;  // 生成完成后允许人工编辑
@@ -167,6 +250,7 @@ function handle(m){
       break;
     case "AI_SHOWING": $("stateLabel").textContent="SHOWING"; break;
     case "AI_KILLED":
+      if(m.invocation_id===speechInv){ $("speechCard").innerHTML="<span class='state'>已急停</span>"; $("speechCard").contentEditable="false"; speechInv=null; speechText=""; break; }
       $("stateLabel").textContent="IDLE"; $("aiCard").innerHTML="<span class='state'>已急停</span>"; $("aiCard").contentEditable="false";
       // 同上：急停后卡片是状态占位文本，清掉 curInv 防止误投屏；
       // 想继续用直接按任务键，想重生成按 R（curTask 仍保留）
@@ -204,15 +288,50 @@ function draftSeg(text){
   $("transcript").scrollTop=$("transcript").scrollHeight;
 }
 function finalSeg(id,text){
-  // 已确认终稿（黑色），每条独立，可点击修正
-  let el=document.getElementById("seg-"+id);
-  if(!el){ el=document.createElement("div"); el.className="seg final"; el.id="seg-"+id; el.contentEditable="true";
+  // 已确认终稿（黑色），每条独立，可点击修正。
+  // 外层 .segwrap 承载「说话人标记」（标记不参与编辑，避免人工改字时被写进转写）。
+  let wrap=document.getElementById("wrap-"+id);
+  if(!wrap){
+    wrap=document.createElement("div"); wrap.className="segwrap"; wrap.id="wrap-"+id;
+    const tag=document.createElement("span"); tag.className="spk"; wrap.appendChild(tag);
+    const el=document.createElement("div"); el.className="seg final"; el.id="seg-"+id; el.contentEditable="true";
     el.addEventListener("blur",()=>{ if(el.dataset.text!==el.innerText){ fetch(`${BASE}/api/segment/${id}`,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:el.innerText})}); el.dataset.text=el.innerText; }});
-    $("transcript").appendChild(el); }
+    wrap.appendChild(el);
+    $("transcript").appendChild(wrap);
+  }
+  const el=document.getElementById("seg-"+id);
   el.dataset.text=text; el.textContent=text;
   // 终稿确认后清空草稿行
   const d=document.getElementById("seg-draft"); if(d) d.remove();
   $("transcript").scrollTop=$("transcript").scrollHeight;
+}
+// ---- 说话人区分：把 CAM++ sidecar 判定的说话人标到对应句子上 ----
+// 换人时在上方画虚线分隔（「不同说话人 → 换行 + 标记」）；同人则去掉分隔，
+// 因此每次标记都要顺带重算下一条的分隔状态（结果可能晚于下一条到达）。
+function markSpeaker(segId,speaker,label){
+  const wrap=document.getElementById("wrap-"+segId); if(!wrap) return;
+  wrap.dataset.spk=speaker||"";
+  const tag=wrap.querySelector(".spk");
+  if(tag) tag.textContent=label||speaker||"说话人";
+  wrap.classList.add("has-spk");
+  syncSpeakerBreak(wrap);
+  const next=nextWrap(wrap); if(next&&next.dataset.spk) syncSpeakerBreak(next);
+}
+function syncSpeakerBreak(wrap){
+  const prev=prevWrap(wrap);
+  if(prev&&prev.dataset.spk&&prev.dataset.spk===wrap.dataset.spk) wrap.classList.remove("new-speaker");
+  else wrap.classList.add("new-speaker");
+}
+function prevWrap(el){ let p=el.previousElementSibling; while(p&&!p.classList.contains("segwrap")) p=p.previousElementSibling; return p; }
+function nextWrap(el){ let n=el.nextElementSibling; while(n&&!n.classList.contains("segwrap")) n=n.nextElementSibling; return n; }
+// 本场说话人名单（页脚显示 S1 S2 …，便于操作员核对有几位）
+async function loadSpeakers(){
+  if(!sid){ return; }
+  try{
+    const r=await fetch(BASE+"/api/speakers").then(r=>r.json());
+    const list=(r&&r.speakers)||[];
+    $("spkStatus").textContent=list.length?("说话人: "+list.map(s=>s.label||s.speaker).join("、")):"说话人: 未识别";
+  }catch(e){}
 }
 function reviseSeg(id,text,source){
   // 回退修正：服务端纠错或 LLM 顺句改写后，覆盖更新已显示的句子
@@ -253,6 +372,12 @@ async function startSession(){
       return;
     }
     sid=r.session_id;   // 直接取响应里的 id，不等 WS 的 SESSION 事件（否则自动开麦时 sid 可能还是空）
+    // 新 session：说话人编号从 S1 重新开始（服务端已重置），右下角发言稿也清空 ——
+    // 免得沿用上一场的稿子被误投到大屏
+    $("spkStatus").textContent="说话人: -";
+    speechInv=null; speechText=""; speechReq=null;
+    $("speechCard").innerHTML="<span class='state'>在中间栏填写「立场」并点「发言」，生成的发言稿会显示在这里。</span>";
+    $("speechCard").contentEditable="false"; $("speechMeta").textContent="";
     let info=r.session_id;
     // 以服务端**实际生效**的音源为准：本机声卡打开失败时服务端会自动降级为 browser，
     // 这时也必须把浏览器麦克风打开，否则没有音频进来。
@@ -278,6 +403,52 @@ $("btnKill").onclick=()=>{ post("/api/kill"); $("stateLabel").textContent="IDLE"
 $("btnShow").onclick=()=>curInv&&post(`/api/invocation/${curInv}/show`,{text:$("aiCard").innerText.trim()||null});  // 投屏带编辑后文本
 $("btnDiscard").onclick=()=>curInv&&post(`/api/invocation/${curInv}/discard`);
 $("btnRegen").onclick=()=>curTask&&invoke(curTask,$("target").value||null);
+// ---- 发言：立场 + 语言/长度 → 发言稿（右下角展示区）----
+async function generateSpeech(){
+  if(!sid){ alert("请先开始 Session"); return; }
+  const stance=$("stance").value.trim();
+  if(!stance){ alert("请先填写立场：这段发言要服务于什么观点？"); $("stance").focus(); return; }
+  const req={task:"SPEECH",stance:stance,language:$("spLang").value,length:$("spLen").value,extra:$("spExtra").value.trim()};
+  if(!req.length) req.length="medium";
+  speechReq=req;                      // 记住本次参数，供「重生成」用
+  speechText=""; speechInv=null;
+  $("speechCard").innerHTML="<span class='state'>生成中…（发言稿比短翻译长，通常 5~30 秒）</span>";
+  $("speechCard").contentEditable="false";
+  $("speechMeta").textContent="";
+  await post("/api/invoke",req);
+}
+$("btnSpeech").onclick=generateSpeech;
+$("btnSpeechRegen").onclick=()=>{ if(speechReq) { $("stance").value=speechReq.stance||$("stance").value; post("/api/invoke",speechReq); } else generateSpeech(); };
+$("btnSpeechShow").onclick=()=>speechInv&&post(`/api/invocation/${speechInv}/show`,{text:$("speechCard").innerText.trim()||null});
+$("btnSpeechCopy").onclick=async()=>{
+  const t=$("speechCard").innerText.trim();
+  if(!speechInv||!t){ $("speechMeta").textContent="还没有发言稿"; return; }
+  try{ await navigator.clipboard.writeText(t); $("speechMeta").textContent="已复制 "+t.length+" 字"; }
+  catch(e){ $("speechMeta").textContent="复制失败（浏览器限制剪贴板，请手动选中复制）"; }
+};
+// 发言稿编辑：失焦即保存（若正在投屏，大屏实时同步）
+$("speechCard").addEventListener("blur",()=>{
+  const el=$("speechCard"), t=el.innerText.trim();
+  if(speechInv && t && el.dataset.text!==undefined && t!==el.dataset.text){
+    el.dataset.text=t; speechText=t;
+    fetch(`${BASE}/api/invocation/${speechInv}`,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:t})});
+  }
+});
+// 立场框内 Ctrl/Cmd+Enter = 点「发言」；单独 Enter 留给换行
+$("stance").addEventListener("keydown",e=>{ if(e.key==="Enter"&&(e.metaKey||e.ctrlKey)){ e.preventDefault(); generateSpeech(); } });
+// 语言/长度档位由后端下发（字数窗口与校验口径必须一致，不能前端写死）
+async function loadSpeechOptions(){
+  try{
+    const r=await fetch(BASE+"/api/speech/options").then(r=>r.json());
+    const langSel=$("spLang"), lenSel=$("spLen");
+    const keepL=langSel.value, keepN=lenSel.value;
+    langSel.innerHTML=""; (r.languages||["中文"]).forEach(v=>{ const o=document.createElement("option"); o.value=v; o.textContent=v; langSel.appendChild(o); });
+    lenSel.innerHTML=""; (r.lengths||[]).forEach(l=>{ const o=document.createElement("option"); o.value=l.key; o.textContent=l.label+"（"+l.min_chars+"~"+l.max_chars+" 字）"; lenSel.appendChild(o); });
+    if(keepL) langSel.value=keepL;
+    lenSel.value=keepN||r.default_length||"medium";
+    if(!lenSel.value) lenSel.value="medium";
+  }catch(e){ /* 后端不可达时保留 HTML 里的兜底选项 */ }
+}
 // AI 输出卡编辑：失焦即保存；若正在投屏，大屏实时同步（PATCH 内部处理）
 $("aiCard").addEventListener("blur",()=>{
   const el=$("aiCard"), t=el.innerText.trim();
@@ -288,7 +459,10 @@ $("aiCard").addEventListener("blur",()=>{
 });
 // 快捷键
 addEventListener("keydown",e=>{
-  if(e.target.tagName==="INPUT"||e.target.isContentEditable) return;  // 输入/编辑中不触发快捷键
+  // 输入/编辑中不触发快捷键。TEXTAREA/SELECT 也必须排除：
+  // 「立场」是多行输入框，在里面打字（含数字、退格、R）不应触发投屏/丢弃/重生成。
+  const tag=e.target.tagName;
+  if(tag==="INPUT"||tag==="TEXTAREA"||tag==="SELECT"||e.target.isContentEditable) return;
   const map={"1":"TERM","2":"Q_TRANSLATE","3":"A_TRANSLATE","4":"BRIDGE","5":"SUMMARY"};
   if(map[e.key]) invoke(map[e.key]);
   else if(e.key==="Enter") $("btnShow").click();
@@ -319,7 +493,16 @@ setInterval(async()=>{ try{ const h=await fetch(BASE+"/api/health").then(r=>r.js
   $("llmStatus").textContent="LLM:"+h.llm;
   if(h.capture==="browser"){ $("micStatus").textContent="收音:"+(h.mic==="connected"?"采集中（浏览器）":"等待浏览器连接"); }
   else if(h.capture==="mic"){ $("micStatus").textContent="收音: 服务器本机麦克风"; }
-  else { $("micStatus").textContent="收音: 未启动"; } }catch(e){} },3000);
+  else { $("micStatus").textContent="收音: 未启动"; }
+  // 说话人区分状态：off=未启用（配置项） / ok=sidecar 就绪 / offline=不可达（标记会缺失）
+  const spk=$("spkStatus"), dd=h.diarize_detail||{};
+  if(h.diarize==="off"){ spk.textContent="说话人: 未启用"; }
+  else if(h.diarize==="ok"){ spk.textContent="说话人: 区分中（已标 "+((dd.assigned!=null)?dd.assigned:0)+" 句）"; }
+  else if(h.diarize==="offline"){
+    // sidecar 没起来时给出可操作提示，而不是只说"离线"
+    spk.textContent = (dd.failed>0) ? "说话人: sidecar 不可达（见 sessions/diarize.log）" : "说话人: sidecar 连接中…";
+  }
+}catch(e){} },3000);
 // ---- 浏览器收音（远端：浏览器麦克风 → /ws/audio → 服务器 ASR）----
 let micOn=false, micCtx=null, micStream=null, micProc=null, micWs=null;
 function downsample(buf,inRate,outRate){
@@ -450,6 +633,7 @@ if($("targetDiscipline")){
 // 初始化：WS 已在文件开头建立；其余各自隔离，任一失败不影响其它
 try{ loadHotwords(); }catch(e){ console.error(e); }
 try{ loadTargetDiscipline(); }catch(e){ console.error(e); }
+try{ loadSpeechOptions(); }catch(e){ console.error(e); }
 </script>
 </body>
 </html>

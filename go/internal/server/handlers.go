@@ -14,6 +14,7 @@ import (
 
 	"github.com/gen2brain/malgo"
 
+	"seat/internal/agent"
 	"seat/internal/asr"
 	"seat/internal/audio"
 	"seat/internal/contextx"
@@ -65,6 +66,12 @@ type hotwordsToggleIn struct {
 type invokeIn struct {
 	Task   string `json:"task"`
 	Target string `json:"target"`
+
+	// 「发言」任务专用（task=SPEECH 时生效）：
+	Stance   string `json:"stance"`   // 立场（必填）
+	Language string `json:"language"` // 语言：中文 / English / 中英双语
+	Length   string `json:"length"`   // 长度档位：short / medium / long
+	Extra    string `json:"extra"`    // 补充要求（可选）
 }
 
 type reviseIn struct {
@@ -493,12 +500,44 @@ func (s *Server) handleInvoke(w http.ResponseWriter, r *http.Request) {
 		cancel()
 	}()
 
-	iid, err := ag.Generate(ctx, sid, body.Task, body.Target, focus, s.rt.TargetDiscipline())
+	// 「发言」：按立场 + 会议上下文起草发言稿（与 5 个翻译任务共用生成链路，
+	// 前端据事件里的 task=SPEECH 把结果渲染到右下角的发言稿区）
+	var iid string
+	if body.Task == agent.TaskSpeech {
+		iid, err = ag.GenerateSpeech(ctx, sid, agent.SpeechOptions{
+			Stance: body.Stance, Language: body.Language, Length: body.Length, Extra: body.Extra,
+		}, focus, s.rt.TargetDiscipline())
+	} else {
+		iid, err = ag.Generate(ctx, sid, body.Task, body.Target, focus, s.rt.TargetDiscipline())
+	}
 	if err != nil {
 		writeJSON(w, 500, map[string]any{"error": err.Error()})
 		return
 	}
 	writeJSON(w, 200, map[string]any{"invocation_id": iid})
+}
+
+// handleSpeechOptions 发言可选的语言/长度档位。
+// 由后端下发而不是前端写死：字数窗口同时被校验函数使用，两处必须一致，
+// 否则会出现「选了 2 分钟但模型按 30 秒校验」这类难查的偏差。
+func (s *Server) handleSpeechOptions(w http.ResponseWriter, r *http.Request) {
+	lengths := make([]map[string]any, 0, len(agent.SpeechLengths))
+	for _, l := range agent.SpeechLengths {
+		lengths = append(lengths, map[string]any{
+			"key": l.Key, "label": l.Label, "seconds": l.Seconds,
+			"min_chars": l.MinChars, "max_chars": l.MaxChars,
+		})
+	}
+	writeJSON(w, 200, map[string]any{
+		"languages":      agent.SpeechLanguages,
+		"lengths":        lengths,
+		"default_length": "medium",
+	})
+}
+
+// handleSpeakers 本场已识别出的说话人（说话人区分结果，按句子聚合）。
+func (s *Server) handleSpeakers(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]any{"speakers": s.rt.Speakers()})
 }
 
 // handleGetTargetDiscipline 当前目标学科（页面加载时回填下拉框）。
@@ -645,6 +684,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		asrURL = st.Qwen3Backend
 	}
 
+	// 说话人区分状态（off/ok/offline + 计数），供状态条显示
+	diarState, diarDetail := s.rt.DiarizeStatus()
+
 	writeJSON(w, 200, map[string]any{
 		"asr":          info.State,
 		"asr_detail":   info.Detail,
@@ -659,5 +701,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"capture":        s.rt.CaptureMode(),
 		"mic":            micState,
 		"state":          string(s.rt.Display.State()),
+		"diarize":        diarState,
+		"diarize_detail": diarDetail,
 	})
 }

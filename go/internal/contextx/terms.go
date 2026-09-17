@@ -54,11 +54,58 @@ var academicPrefix = []string{
 }
 
 var (
-	reAbbr   = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9\-]+$`)
 	reHasCN  = regexp.MustCompile(`[\x{4e00}-\x{9fff}]`)
 	reHasEN  = regexp.MustCompile(`[A-Za-z]`)
 	rePureCN = regexp.MustCompile(`^[\x{4e00}-\x{9fff}]+$`)
 )
+
+// isAbbreviation 判断英文 token 是否像专业缩写。
+//
+// 旧实现用正则 ^[A-Za-z][A-Za-z0-9\-]+$ —— 它匹配任何 ≥2 个字母的英文单词，
+// 于是 "we use plasma to grow materials" 里**每个词**都被当成缩写抽成候选。
+// 真正的缩写有明确形态：
+//
+//	① 含数字（化学式 / 型号）：TiO2 / CO2 / 2D / H2O
+//	② 全大写（≥2 字母）：DFT / XRD / MRI / DNA / CNT
+//	③ 含非首位的大写（驼峰 / 化学式）：mRNA / iPSC / SiC / GaAs
+//	④ 连字符且有大写：X-ray / T-cell
+//
+// 纯小写单词（plasma / materials / approach）一律不算 —— 它们若是真术语，
+// 应由讲稿解析出的术语表（3.0 分）命中，而不是靠形态蒙。
+func isAbbreviation(w string) bool {
+	letters, uppers, digits := 0, 0, 0
+	hasHyphen := false
+	for i, r := range w {
+		switch {
+		case r == '-':
+			hasHyphen = true
+		case unicode.IsDigit(r):
+			digits++
+		case unicode.IsLetter(r):
+			letters++
+			if unicode.IsUpper(r) {
+				uppers++
+				// ③ 大写出现在非首位 → 驼峰或化学式
+				if i > 0 {
+					return true
+				}
+			}
+		}
+	}
+	if letters < 2 {
+		return false
+	}
+	if digits > 0 { // ①
+		return true
+	}
+	if uppers == letters { // ②
+		return true
+	}
+	if hasHyphen && uppers > 0 { // ④
+		return true
+	}
+	return false
+}
 
 // enStop 英文停用词（避免 the/this/and 被当缩写）。
 var enStop = map[string]struct{}{
@@ -68,10 +115,16 @@ var enStop = map[string]struct{}{
 	"ppt": {}, "ai": {},
 }
 
-// nounFlags 可作为术语（组成部分）的词性：名词类 / 动名词 / 英文 / 简称 / 未知专名。
-var nounFlags = map[string]struct{}{
+// termFlags 可作为术语（或其组成部分）的词性。
+//
+// 比「只认名词」宽：jieba 会把核心学术词标成动词 —— 实测「超导」「纠缠」「相变」
+// 「自旋」「拓扑」全是 v。旧实现只认名词，这些词虽然在学术后缀白名单里能命中，
+// 却因词性先被挡在门外，整条链路失效（「中文专业术语抽不出来」的主因之一）。
+// 放宽后仍必须过 isAcademicCN 白名单，精度不降。
+var termFlags = map[string]struct{}{
 	"n": {}, "nz": {}, "nt": {}, "ns": {}, "nr": {}, "ng": {}, "nrt": {},
-	"vn": {}, "an": {}, "eng": {}, "j": {}, "l": {}, "x": {},
+	"vn": {}, "v": {}, "vd": {}, "an": {}, "a": {}, "ad": {},
+	"eng": {}, "j": {}, "l": {}, "x": {},
 }
 
 // ---- jieba 懒加载 ----
@@ -163,6 +216,20 @@ func fallbackTokens(text string) []token {
 	return out
 }
 
+// mergeHeadBlock 不能作为复合术语首部的泛用动词。
+//
+// 它们是封闭的功能词类（可带任何宾语、不携带学科信息），但 jieba 标成 v，
+// 仅靠词性挡不住。放宽 v 词性后实测拼出了「改变载流子」「具有手性」这类假术语，
+// 这一层专门拦它们。注意不要收进「控制」「影响」「测量」「观察」这类可作术语首部的词
+// （控制理论 / 测量精度 / 观察结果都是正常术语）。
+var mergeHeadBlock = map[string]struct{}{
+	"改变": {}, "具有": {}, "使用": {}, "采用": {}, "得到": {}, "进行": {}, "实现": {},
+	"提供": {}, "包含": {}, "导致": {}, "引起": {}, "形成": {}, "产生": {}, "增加": {},
+	"减少": {}, "提高": {}, "降低": {}, "获得": {}, "利用": {}, "需要": {}, "要求": {},
+	"表示": {}, "说明": {}, "证明": {}, "给出": {}, "建立": {}, "属于": {}, "存在": {},
+	"反映": {}, "对应": {}, "作为": {}, "成为": {}, "变成": {}, "保持": {}, "达到": {},
+}
+
 // ---- 规则 ----
 
 func isAcademicCN(w string) bool {
@@ -173,12 +240,11 @@ func isAcademicCN(w string) bool {
 	if _, bad := stopWords[w]; bad {
 		return false
 	}
-	// 含口语词作为子串（如"这个结构"）→ 不是干净术语
-	for s := range stopWords {
-		if strings.Contains(w, s) {
-			return false
-		}
-	}
+	// 注：这里曾有一条「含 stopWord 子串即否决」的规则，用来挡「这个结构」这类噪声。
+	// 但 w 是 jieba 已切好的**单个 token**，口语词在分词阶段就被切开了，该规则实际
+	// 拦下的是正常复合术语：作用力(含"作用")、工作温度(含"工作")、关系代数(含"关系")、
+	// 过程控制(含"过程")、结果分析(含"结果")——全部被误杀。噪声改由上面的整词相等
+	// 检查与合并路径的 stopWords 检查负责，这里不再做子串否决。
 	for _, suf := range academicSuffix {
 		if strings.HasSuffix(w, suf) {
 			return true
@@ -248,7 +314,7 @@ func ScoreText(text string, glossary map[string]int) []Term {
 		hasEN := reHasEN.MatchString(w)
 		switch {
 		case hasEN && !hasCN:
-			if !reAbbr.MatchString(w) {
+			if !isAbbreviation(w) {
 				continue
 			}
 			if _, bad := enStop[strings.ToLower(w)]; bad {
@@ -262,20 +328,20 @@ func ScoreText(text string, glossary map[string]int) []Term {
 		case hasEN && hasCN:
 			setMax(cand, w, 1.4)
 		default:
-			if _, ok := nounFlags[tk.flag]; ok && isAcademicCN(w) {
+			if _, ok := termFlags[tk.flag]; ok && isAcademicCN(w) {
 				setMax(cand, w, 1.0)
 			}
 		}
 	}
 
-	// 5) 相邻**名词**组合成复合术语（表面+张力 → 表面张力）
-	//    要求两部分均为名词性且长度≥2，避免 "的"+"模型"、"观察"+"蛋白" 这类噪声
+	// 5) 相邻术语词组合成复合术语（超导+相变 → 超导相变）
+	//    要求两部分均为术语性词性且长度≥2，避免 "的"+"模型"、"观察"+"蛋白" 这类噪声
 	for i := 0; i+1 < len(tagged); i++ {
 		a, b := tagged[i], tagged[i+1]
-		if _, ok := nounFlags[a.flag]; !ok {
+		if _, ok := termFlags[a.flag]; !ok {
 			continue
 		}
-		if _, ok := nounFlags[b.flag]; !ok {
+		if _, ok := termFlags[b.flag]; !ok {
 			continue
 		}
 		if utf8.RuneCountInString(a.word) < 2 || utf8.RuneCountInString(b.word) < 2 {
@@ -285,6 +351,9 @@ func ScoreText(text string, glossary map[string]int) []Term {
 			continue
 		}
 		if _, bad := stopWords[b.word]; bad {
+			continue
+		}
+		if _, bad := mergeHeadBlock[a.word]; bad {
 			continue
 		}
 		if !rePureCN.MatchString(a.word) || !rePureCN.MatchString(b.word) {

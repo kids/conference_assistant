@@ -95,16 +95,22 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	if body.AIEnabled != nil {
 		aiEnabled = *body.AIEnabled
 	}
-	// 新 session 从表单取值；未传则回到默认「白话」。
-	// 非法值不阻断开会：回退为当前值（校验失败原因由 /api/target-discipline 单独提示）。
-	_, _ = s.rt.SetTargetDiscipline(body.TargetDiscipline)
+	rt, err := s.reg.Create(body.Title, body.Speaker, body.Institution, body.Discipline, aiEnabled)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	// 目标学科作用于新会场；未传则回到默认「白话」。
+	// 非法值不阻断开会：回退为默认（校验失败原因由 /api/target-discipline 单独提示）。
+	_, _ = rt.SetTargetDiscipline(body.TargetDiscipline)
 
-	res, err := s.rt.CreateSession(body.Title, body.Speaker, body.Institution, body.Discipline,
+	res, err := rt.initSession(body.Title, body.Speaker, body.Institution, body.Discipline,
 		aiEnabled, body.ReplayPath, body.Capture)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
+	s.setCurrent(rt)
 	writeJSON(w, 200, res)
 }
 
@@ -114,11 +120,19 @@ func (s *Server) handleStartSession(w http.ResponseWriter, r *http.Request) {
 	_ = decodeBody(r, &body)
 	body.withDefaults()
 
-	s.rt.mu.Lock()
-	s.rt.sessionID = sid
-	s.rt.mu.Unlock()
+	// 按 sid 取会场（未注册时按 DB 记录恢复，支持刷新/分享链接/重启后回到原会场）
+	rt, err := s.reg.Ensure(sid)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if rt == nil {
+		writeErr(w, badRequest("会话不存在：%s", sid))
+		return
+	}
+	s.setCurrent(rt)
 
-	res, err := s.rt.StartPipeline("", body.Capture)
+	res, err := rt.StartPipeline("", body.Capture)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -128,14 +142,23 @@ func (s *Server) handleStartSession(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleStopSession(w http.ResponseWriter, r *http.Request) {
 	sid := r.PathValue("sid")
-	s.rt.StopPipeline()
-	_ = s.rt.Store.SetEnded(sid)
+	rt, err := s.reg.Ensure(sid)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if rt == nil {
+		writeErr(w, badRequest("会话不存在：%s", sid))
+		return
+	}
+	rt.StopPipeline()
+	_ = rt.Store.SetEnded(sid)
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
 func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	sid := r.PathValue("sid")
-	segs, err := s.rt.Store.RecentSegments(sid, 0, 500)
+	segs, err := s.current(r).Store.RecentSegments(sid, 0, 500)
 	if err != nil {
 		writeErr(w, serverError("查询转写失败: %v", err))
 		return
@@ -153,14 +176,14 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetHotwords(w http.ResponseWriter, r *http.Request) {
-	s.rt.mu.Lock()
-	words := s.rt.sessionHotwords
+	s.current(r).mu.Lock()
+	words := s.current(r).sessionHotwords
 	if len(words) == 0 {
-		words = s.rt.baseGlossary
+		words = s.current(r).baseGlossary
 	}
-	enabled := s.rt.hotwordsEnabled
+	enabled := s.current(r).hotwordsEnabled
 	out := copyMap(words)
-	s.rt.mu.Unlock()
+	s.current(r).mu.Unlock()
 
 	writeJSON(w, 200, map[string]any{"words": out, "enabled": enabled})
 }
@@ -171,13 +194,13 @@ func (s *Server) handlePutHotwords(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"error": "请求体解析失败: " + err.Error()})
 		return
 	}
-	s.rt.mu.Lock()
-	old := copyMap(s.rt.sessionHotwords)
-	s.rt.mu.Unlock()
+	s.current(r).mu.Lock()
+	old := copyMap(s.current(r).sessionHotwords)
+	s.current(r).mu.Unlock()
 
 	newWords := asr.ParseHotwordsText(body.Text, old)
-	s.rt.setSessionHotwords(newWords)
-	s.rt.pushHotwords()
+	s.current(r).setSessionHotwords(newWords)
+	s.current(r).pushHotwords()
 	writeJSON(w, 200, map[string]any{"ok": true, "count": len(newWords)})
 }
 
@@ -187,10 +210,10 @@ func (s *Server) handleToggleHotwords(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"error": "请求体解析失败: " + err.Error()})
 		return
 	}
-	s.rt.mu.Lock()
-	s.rt.hotwordsEnabled = body.Enabled
-	s.rt.mu.Unlock()
-	s.rt.pushHotwords()
+	s.current(r).mu.Lock()
+	s.current(r).hotwordsEnabled = body.Enabled
+	s.current(r).mu.Unlock()
+	s.current(r).pushHotwords()
 	writeJSON(w, 200, map[string]any{"ok": true, "enabled": body.Enabled})
 }
 
@@ -200,12 +223,12 @@ func (s *Server) handleGenerateHotwords(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, 400, map[string]any{"error": "请求体解析失败: " + err.Error()})
 		return
 	}
-	ag := s.rt.Agent()
+	ag := s.current(r).Agent()
 	if ag == nil || ag.LLM == nil {
 		writeJSON(w, 400, map[string]any{"error": "LLM 未配置"})
 		return
 	}
-	sid := s.rt.SessionID()
+	sid := s.current(r).SessionID()
 	if sid == "" {
 		writeJSON(w, 400, map[string]any{"error": "请先创建 session"})
 		return
@@ -220,7 +243,7 @@ func (s *Server) handleGenerateHotwords(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	sessionDir := filepath.Join(s.rt.Settings.DataDirPath(), sid)
+	sessionDir := filepath.Join(s.current(r).Settings.DataDirPath(), sid)
 	materialsDir := filepath.Join(sessionDir, "materials")
 	_ = mkdirAll(materialsDir)
 
@@ -230,27 +253,27 @@ func (s *Server) handleGenerateHotwords(w http.ResponseWriter, r *http.Request) 
 	if result.Profile != "" {
 		writeFile(filepath.Join(materialsDir, "speaker_profile.md"),
 			"# 报告人背景\n\n"+result.Profile+"\n")
-		s.rt.mu.Lock()
-		mgr := s.rt.context
-		s.rt.mu.Unlock()
+		s.current(r).mu.Lock()
+		mgr := s.current(r).context
+		s.current(r).mu.Unlock()
 		if mgr != nil {
 			mgr.InvalidateStatic()
 		}
 	}
-	s.rt.setSessionHotwords(result.Hotwords)
+	s.current(r).setSessionHotwords(result.Hotwords)
 
 	applied := "asr_reconnect"
-	s.rt.mu.Lock()
-	hasClient := s.rt.asrClient != nil
-	s.rt.mu.Unlock()
+	s.current(r).mu.Lock()
+	hasClient := s.current(r).asrClient != nil
+	s.current(r).mu.Unlock()
 	if hasClient {
-		s.rt.pushHotwords()
+		s.current(r).pushHotwords()
 	} else {
-		if _, err := s.rt.StartPipeline("", "mic"); err == nil {
+		if _, err := s.current(r).StartPipeline("", "mic"); err == nil {
 			applied = "pipeline_start"
 		}
 	}
-	s.rt.Bus.Publish(events.Event{
+	s.current(r).Bus.Publish(events.Event{
 		"type": "HOTWORDS_STATUS", "status": "generated:" + strconv.Itoa(len(result.Hotwords)),
 	})
 	writeJSON(w, 200, map[string]any{
@@ -275,12 +298,12 @@ const maxUploadBytes = 32 << 20
 // 为什么存摘要而不是解析原文：幻灯片解析出来是碎片化的，信噪比低；每次调用都带
 // 全文会拉长 hy3 的思考时间，而实时翻译对延迟敏感。原文另存 uploads/ 仅供追溯。
 func (s *Server) handleUploadMaterial(w http.ResponseWriter, r *http.Request) {
-	ag := s.rt.Agent()
+	ag := s.current(r).Agent()
 	if ag == nil || ag.LLM == nil {
 		writeJSON(w, 400, map[string]any{"error": "LLM 未配置"})
 		return
 	}
-	sid := s.rt.SessionID()
+	sid := s.current(r).SessionID()
 	if sid == "" {
 		writeJSON(w, 400, map[string]any{"error": "请先创建 session"})
 		return
@@ -304,7 +327,7 @@ func (s *Server) handleUploadMaterial(w http.ResponseWriter, r *http.Request) {
 	}
 	// 体积预检：网关对请求体有 2 MiB 上限，超出会被静默截断，
 	// 上游只回一个看不懂的 multipart 解析错误。这里提前拦住。
-	if err := contextx.CheckUploadSize(len(data), s.rt.Settings.DocMaxBytes); err != nil {
+	if err := contextx.CheckUploadSize(len(data), s.current(r).Settings.DocMaxBytes); err != nil {
 		writeJSON(w, 413, map[string]any{"error": err.Error()})
 		return
 	}
@@ -315,7 +338,7 @@ func (s *Server) handleUploadMaterial(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 解析超时可配（DOC_PARSE_TIMEOUT，默认 180s）；外层 ctx 必须大于 解析 + LLM 之和
-	parseTimeout := time.Duration(s.rt.Settings.DocParseTimeout * float64(time.Second))
+	parseTimeout := time.Duration(s.current(r).Settings.DocParseTimeout * float64(time.Second))
 	if parseTimeout <= 0 {
 		parseTimeout = 180 * time.Second
 	}
@@ -325,7 +348,7 @@ func (s *Server) handleUploadMaterial(w http.ResponseWriter, r *http.Request) {
 	// 体积与耗时都打日志：解析失败时这两个数字是判断「服务慢」还是「网络不通」的唯一依据
 	log.Printf("[upload] 解析讲稿：%s（%.1f MB，超时 %.0fs）", filename, float64(len(data))/(1<<20), parseTimeout.Seconds())
 	parseStart := time.Now()
-	doc, err := contextx.ParseDocument(ctx, s.rt.Settings.DocParseURL, filename, data, parseTimeout)
+	doc, err := contextx.ParseDocument(ctx, s.current(r).Settings.DocParseURL, filename, data, parseTimeout)
 	if err != nil {
 		log.Printf("[upload] 解析失败（已等 %.1fs）：%v", time.Since(parseStart).Seconds(), err)
 		writeJSON(w, 502, map[string]any{"error": "文档解析失败：" + err.Error()})
@@ -333,13 +356,13 @@ func (s *Server) handleUploadMaterial(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("[upload] 解析完成：正文 %d 字，耗时 %.1fs", len([]rune(doc.Content)), time.Since(parseStart).Seconds())
 
-	profile, err := contextx.BuildFromDocument(ctx, ag.LLM, doc.Content, s.rt.Settings.DocDigestChars)
+	profile, err := contextx.BuildFromDocument(ctx, ag.LLM, doc.Content, s.current(r).Settings.DocDigestChars)
 	if err != nil {
 		writeJSON(w, 500, map[string]any{"error": "热词抽取失败：" + err.Error()})
 		return
 	}
 
-	sessionDir := filepath.Join(s.rt.Settings.DataDirPath(), sid)
+	sessionDir := filepath.Join(s.current(r).Settings.DataDirPath(), sid)
 	materialsDir := filepath.Join(sessionDir, "materials")
 	if err := mkdirAll(materialsDir); err != nil {
 		writeJSON(w, 500, map[string]any{"error": "创建资料目录失败: " + err.Error()})
@@ -358,7 +381,7 @@ func (s *Server) handleUploadMaterial(w http.ResponseWriter, r *http.Request) {
 	writeFile(filepath.Join(sessionDir, "uploads", stem+".txt"), doc.Content)
 
 	// 热词与已有 session 热词合并（可连续上传多份资料），同名词以新权重覆盖
-	merged := s.rt.sessionHotwordsOnly()
+	merged := s.current(r).sessionHotwordsOnly()
 	if merged == nil {
 		merged = map[string]int{}
 	}
@@ -372,28 +395,28 @@ func (s *Server) handleUploadMaterial(w http.ResponseWriter, r *http.Request) {
 	if len(profile.Hotwords) > 0 {
 		_ = asr.SaveHotwords(filepath.Join(sessionDir, "hotwords.txt"), merged)
 	}
-	s.rt.setSessionHotwords(merged)
+	s.current(r).setSessionHotwords(merged)
 
 	// 摘要改变了 STATIC 上下文，让上下文缓存失效
-	s.rt.mu.Lock()
-	mgr := s.rt.context
-	s.rt.mu.Unlock()
+	s.current(r).mu.Lock()
+	mgr := s.current(r).context
+	s.current(r).mu.Unlock()
 	if mgr != nil {
 		mgr.InvalidateStatic()
 	}
 
 	applied := "asr_reconnect"
-	s.rt.mu.Lock()
-	hasClient := s.rt.asrClient != nil
-	s.rt.mu.Unlock()
+	s.current(r).mu.Lock()
+	hasClient := s.current(r).asrClient != nil
+	s.current(r).mu.Unlock()
 	if hasClient {
-		s.rt.pushHotwords()
+		s.current(r).pushHotwords()
 	} else {
-		if _, err := s.rt.StartPipeline("", "mic"); err == nil {
+		if _, err := s.current(r).StartPipeline("", "mic"); err == nil {
 			applied = "pipeline_start"
 		}
 	}
-	s.rt.Bus.Publish(events.Event{
+	s.current(r).Bus.Publish(events.Event{
 		"type": "HOTWORDS_STATUS", "status": "generated:" + strconv.Itoa(len(profile.Hotwords)),
 	})
 
@@ -413,12 +436,12 @@ func (s *Server) handleUploadMaterial(w http.ResponseWriter, r *http.Request) {
 
 // handleListMaterials 列出当前 session 已加载的资料（materials/ 目录）。
 func (s *Server) handleListMaterials(w http.ResponseWriter, r *http.Request) {
-	sid := s.rt.SessionID()
+	sid := s.current(r).SessionID()
 	if sid == "" {
 		writeJSON(w, 200, map[string]any{"items": []any{}})
 		return
 	}
-	materialsDir := filepath.Join(s.rt.Settings.DataDirPath(), sid, "materials")
+	materialsDir := filepath.Join(s.current(r).Settings.DataDirPath(), sid, "materials")
 	entries, err := os.ReadDir(materialsDir)
 	if err != nil {
 		writeJSON(w, 200, map[string]any{"items": []any{}})
@@ -482,22 +505,22 @@ func (s *Server) handleInvoke(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"error": "请求体解析失败: " + err.Error()})
 		return
 	}
-	ag := s.rt.Agent()
-	sid := s.rt.SessionID()
+	ag := s.current(r).Agent()
+	sid := s.current(r).SessionID()
 	if ag == nil || sid == "" {
 		writeJSON(w, 400, map[string]any{"error": "请先创建 session"})
 		return
 	}
-	focus, err := s.rt.Store.RecentSegments(sid, 60, 0)
+	focus, err := s.current(r).Store.RecentSegments(sid, 60, 0)
 	if err != nil {
 		focus = nil
 	}
 	// 可取消的生成 context：注册到状态机后，急停/丢弃能立刻中断本次生成
 	// （含 hy3 只流思考内容、没有正文 delta 的阶段）。
 	ctx, cancel := context.WithCancel(r.Context())
-	s.rt.Display.SetCancel(cancel)
+	s.current(r).Display.SetCancel(cancel)
 	defer func() {
-		s.rt.Display.SetCancel(nil)
+		s.current(r).Display.SetCancel(nil)
 		cancel()
 	}()
 
@@ -507,9 +530,9 @@ func (s *Server) handleInvoke(w http.ResponseWriter, r *http.Request) {
 	if body.Task == agent.TaskSpeech {
 		iid, err = ag.GenerateSpeech(ctx, sid, agent.SpeechOptions{
 			Stance: body.Stance, Language: body.Language, Length: body.Length, Extra: body.Extra,
-		}, focus, s.rt.TargetDiscipline())
+		}, focus, s.current(r).TargetDiscipline())
 	} else {
-		iid, err = ag.Generate(ctx, sid, body.Task, body.Target, focus, s.rt.TargetDiscipline())
+		iid, err = ag.Generate(ctx, sid, body.Task, body.Target, focus, s.current(r).TargetDiscipline())
 	}
 	if err != nil {
 		writeJSON(w, 500, map[string]any{"error": err.Error()})
@@ -538,12 +561,12 @@ func (s *Server) handleSpeechOptions(w http.ResponseWriter, r *http.Request) {
 
 // handleSpeakers 本场已识别出的说话人（说话人区分结果，按句子聚合）。
 func (s *Server) handleSpeakers(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{"speakers": s.rt.Speakers()})
+	writeJSON(w, 200, map[string]any{"speakers": s.current(r).Speakers()})
 }
 
 // handleGetTargetDiscipline 当前目标学科（页面加载时回填下拉框）。
 func (s *Server) handleGetTargetDiscipline(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{"discipline": s.rt.TargetDiscipline()})
+	writeJSON(w, 200, map[string]any{"discipline": s.current(r).TargetDiscipline()})
 }
 
 // handleSetTargetDiscipline 设置目标学科（下一次 AI 调用即生效，无需重启 session）。
@@ -553,7 +576,7 @@ func (s *Server) handleSetTargetDiscipline(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, 400, map[string]any{"error": "请求体解析失败: " + err.Error()})
 		return
 	}
-	v, err := s.rt.SetTargetDiscipline(body.Discipline)
+	v, err := s.current(r).SetTargetDiscipline(body.Discipline)
 	if err != nil {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
 		return
@@ -566,23 +589,23 @@ func (s *Server) handleShow(w http.ResponseWriter, r *http.Request) {
 	var body showIn
 	_ = decodeBody(r, &body)
 
-	s.rt.Display.Show()
+	s.current(r).Display.Show()
 	text := ""
 	if strings.TrimSpace(body.Text) != "" {
 		text = strings.TrimSpace(body.Text)
-		_ = s.rt.Store.ReviseInvocation(iid, text) // 编辑版落库（复盘导出用编辑后文本）
+		_ = s.current(r).Store.ReviseInvocation(iid, text) // 编辑版落库（复盘导出用编辑后文本）
 	}
 	if text == "" {
-		if inv, _ := s.rt.Store.GetInvocation(iid); inv != nil {
+		if inv, _ := s.current(r).Store.GetInvocation(iid); inv != nil {
 			text = inv.OutputText
 		}
 	}
 	task := ""
-	if inv, _ := s.rt.Store.GetInvocation(iid); inv != nil {
+	if inv, _ := s.current(r).Store.GetInvocation(iid); inv != nil {
 		task = inv.Task
 	}
-	_ = s.rt.Store.SetStatus(iid, "shown", 0)
-	s.rt.Bus.Publish(events.Event{
+	_ = s.current(r).Store.SetStatus(iid, "shown", 0)
+	s.current(r).Bus.Publish(events.Event{
 		"type": "AI_SHOWING", "invocation_id": iid, "text": text, "task": task,
 	})
 	writeJSON(w, 200, map[string]any{"ok": true})
@@ -595,14 +618,14 @@ func (s *Server) handleReviseInvocation(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, 400, map[string]any{"error": "请求体解析失败: " + err.Error()})
 		return
 	}
-	_ = s.rt.Store.ReviseInvocation(iid, body.Text)
+	_ = s.current(r).Store.ReviseInvocation(iid, body.Text)
 	// 编辑 AI 输出卡；若该卡正在投屏，大屏实时同步更新
-	if s.rt.Display.State() == "SHOWING" && s.rt.Display.Current() == iid {
+	if s.current(r).Display.State() == "SHOWING" && s.current(r).Display.Current() == iid {
 		task := ""
-		if inv, _ := s.rt.Store.GetInvocation(iid); inv != nil {
+		if inv, _ := s.current(r).Store.GetInvocation(iid); inv != nil {
 			task = inv.Task
 		}
-		s.rt.Bus.Publish(events.Event{
+		s.current(r).Bus.Publish(events.Event{
 			"type": "AI_SHOWING", "invocation_id": iid, "text": body.Text, "task": task,
 		})
 	}
@@ -613,12 +636,12 @@ func (s *Server) handleDiscard(w http.ResponseWriter, r *http.Request) {
 	iid := r.PathValue("iid")
 	// 丢弃语义 = 不要这次输出：若它还在生成，一并中止（否则十几秒后 AI_READY 又会把卡片放回来，
 	// 等于丢弃被撤销）。这里只置中止标记，随后用 Clear() 清展示状态、保留标记给在飞的生成自行退出。
-	if s.rt.Display.State() == state.GENERATING && s.rt.Display.Current() == iid {
-		s.rt.Display.Kill()
+	if s.current(r).Display.State() == state.GENERATING && s.current(r).Display.Current() == iid {
+		s.current(r).Display.Kill()
 	}
-	s.rt.Display.Clear()
-	_ = s.rt.Store.SetStatus(iid, "discarded", 0)
-	s.rt.Bus.Publish(events.Event{"type": "AI_STATE", "state": "IDLE", "invocation_id": iid})
+	s.current(r).Display.Clear()
+	_ = s.current(r).Store.SetStatus(iid, "discarded", 0)
+	s.current(r).Bus.Publish(events.Event{"type": "AI_STATE", "state": "IDLE", "invocation_id": iid})
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
@@ -636,16 +659,16 @@ func (s *Server) handleConfirm(w http.ResponseWriter, r *http.Request) {
 	if body.Verdict == "" {
 		body.Verdict = "ok"
 	}
-	_ = s.rt.Store.Confirm(iid, body.By, body.Verdict, body.Note)
+	_ = s.current(r).Store.Confirm(iid, body.By, body.Verdict, body.Note)
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
 func (s *Server) handleKill(w http.ResponseWriter, r *http.Request) {
-	s.rt.Display.Kill()
+	s.current(r).Display.Kill()
 	// 先发事件（此刻 current 还有值，大屏据此下屏），再清展示状态。
 	// 注意用 Clear() 而非 Reset()：Reset() 会清掉急停标记，那样正在飞的生成就不会中止了。
-	s.rt.Bus.Publish(events.Event{"type": "AI_KILLED", "invocation_id": s.rt.Display.Current()})
-	s.rt.Display.Clear()
+	s.current(r).Bus.Publish(events.Event{"type": "AI_KILLED", "invocation_id": s.current(r).Display.Current()})
+	s.current(r).Display.Clear()
 	writeJSON(w, 200, map[string]any{"ok": true})
 }
 
@@ -656,7 +679,7 @@ func (s *Server) handleReviseSegment(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"error": "请求体解析失败: " + err.Error()})
 		return
 	}
-	if err := s.rt.Store.ReviseSegment(segID, body.Text); err != nil {
+	if err := s.current(r).Store.ReviseSegment(segID, body.Text); err != nil {
 		writeErr(w, serverError("修订失败: %v", err))
 		return
 	}
@@ -664,8 +687,8 @@ func (s *Server) handleReviseSegment(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	st := s.rt.Settings
-	info := s.rt.ASRStatus()
+	st := s.current(r).Settings
+	info := s.current(r).ASRStatus()
 
 	llmStatus := "not_configured"
 	if st.LLMBase != "" && st.LLMModel != "" {
@@ -674,7 +697,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 	// 音源与浏览器收音连接状态
 	micState := ""
-	if bc, ok := s.rt.Capture().(*audio.BrowserCapture); ok {
+	if bc, ok := s.current(r).Capture().(*audio.BrowserCapture); ok {
 		if bc.Connected() {
 			micState = "connected"
 		} else {
@@ -691,7 +714,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 说话人区分状态（off/ok/offline + 计数），供状态条显示
-	diarState, diarDetail := s.rt.DiarizeStatus()
+	diarState, diarDetail := s.current(r).DiarizeStatus()
 
 	writeJSON(w, 200, map[string]any{
 		"asr":          info.State,
@@ -704,9 +727,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"llm_model":      st.LLMModel,
 		"protocol":       st.ASRProtocol,
 		"asr_ws_url":     asrURL,
-		"capture":        s.rt.CaptureMode(),
+		"capture":        s.current(r).CaptureMode(),
 		"mic":            micState,
-		"state":          string(s.rt.Display.State()),
+		"state":          string(s.current(r).Display.State()),
 		"diarize":        diarState,
 		"diarize_detail": diarDetail,
 	})

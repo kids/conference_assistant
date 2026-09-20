@@ -77,18 +77,18 @@ type Runtime struct {
 // DefaultTargetDiscipline 默认目标学科。
 const DefaultTargetDiscipline = "白话"
 
-// NewRuntime 创建运行时。
-func NewRuntime(s *config.Settings) (*Runtime, error) {
-	st, err := store.Open(filepath.Join(s.DataDirPath(), "transcript.sqlite"))
-	if err != nil {
-		return nil, err
-	}
+// newSessionRuntime 构造一个会场的运行时。sid 一经构造即固定：
+// 每个会场一个独立实例，跨会场的状态（Bus / Display / 流水线 / 热词 / 说话人）
+// 完全隔离；Store 与 diarizer 由 Registry 共享（sidecar 内部按 session 分组）。
+func newSessionRuntime(s *config.Settings, st *store.Store, dz *diarize.Client, sid string) *Runtime {
 	base := asr.LoadHotwords(s.HotwordsFile())
+	sessionDir := filepath.Join(s.DataDirPath(), sid)
 	rt := &Runtime{
 		Settings:         s,
 		Store:            st,
 		Bus:              events.New(800),
 		Display:          state.New(),
+		sessionID:        sid,
 		captureMode:      "mic",
 		ring:             audio.NewRingBuffer(120, s.SampleRate),
 		baseGlossary:     base,
@@ -97,18 +97,28 @@ func NewRuntime(s *config.Settings) (*Runtime, error) {
 		hotwordsEnabled:  true,
 		roundSegs:        map[string]string{},
 		targetDiscipline: DefaultTargetDiscipline,
+		diarizer:         dz,
 	}
-	if s.DiarizeEnabled {
-		rt.diarizer = diarize.New(s.DiarizeURL, s.DiarizeTimeout, s.DiarizeThreshold, s.DiarizeMinMS)
+	// 恢复已有会场的会话级热词（sessions/<sid>/hotwords.txt；新会场不存在即跳过）
+	if words := asr.LoadHotwords(filepath.Join(sessionDir, "hotwords.txt")); len(words) > 0 {
+		rt.sessionHotwords = words
+		merged := make(map[string]int, len(base)+len(words))
+		for k, v := range base {
+			merged[k] = v
+		}
+		for k, v := range words {
+			merged[k] = v
+		}
+		rt.glossary = merged
+	}
+	rt.context = contextx.NewManager(st, filepath.Join(sessionDir, "materials"))
+	rt.agent = agent.NewRunner(s, rt.context, st, rt.Display, rt.Bus)
+	if dz != nil {
 		rt.spkCh = make(chan spanJob, spanQueue)
 		rt.spkStop = make(chan struct{})
-		log.Printf("[diarize] 说话人区分已启用：%s（阈值 %.2f，最短 %dms，自动拉起 %v）",
-			s.DiarizeURL, s.DiarizeThreshold, s.DiarizeMinMS, s.DiarizeAutostart)
 		rt.startDiarize()
 	}
-	// 录音保留期清理：启动时清一次（新建会话时还会再清一次，见 CreateSession）
-	go sweepRecFiles(s.DataDirPath(), s.RecKeepDays)
-	return rt, nil
+	return rt
 }
 
 // sweepRecFiles 异步清理超保留期的录音文件（REC_KEEP_DAYS，0=不清理）。
@@ -151,14 +161,16 @@ func (rt *Runtime) SetTargetDiscipline(v string) (string, error) {
 	return v, nil
 }
 
-// Close 释放运行时资源。
-func (rt *Runtime) Close() {
+// Close 释放本会场资源（停流水线、停说话人工作协程）。
+// 共享资源（Store、diarizer、词库）由 Registry 统一关闭。
+func (rt *Runtime) Close() { rt.close() }
+
+func (rt *Runtime) close() {
 	rt.StopPipeline()
 	if rt.spkStop != nil {
 		close(rt.spkStop)
+		rt.spkStop = nil
 	}
-	rt.Store.Close()
-	contextx.CloseTerms()
 }
 
 // SessionID 当前会话 id。
@@ -565,35 +577,28 @@ func (rt *Runtime) Agent() *agent.Runner {
 
 // ---- 业务动作 ----
 
-// CreateSession 新建会话并立即启动流水线（不阻塞等热词生成）。
-func (rt *Runtime) CreateSession(title, speaker, institution, discipline string,
+// initSession 会场首次启动：清零说话人表 → 起音频流水线 → 广播 SESSION →（可选）后台生成热词。
+// sid / DB 记录 / 目录已由 Registry.Create 备好，这里只负责「开起来」。
+func (rt *Runtime) initSession(title, speaker, institution, discipline string,
 	aiEnabled bool, replayPath, captureMode string) (map[string]any, error) {
 
-	sid, err := rt.Store.CreateSession(title, speaker, discipline, aiEnabled, institution)
-	if err != nil {
-		return nil, serverError("创建会话失败: %v", err)
-	}
-
+	sid := rt.SessionID()
 	sessionDir := filepath.Join(rt.Settings.DataDirPath(), sid)
 	materialsDir := filepath.Join(sessionDir, "materials")
-	if err := mkdirAll(materialsDir); err != nil {
-		return nil, serverError("创建会话目录失败: %v", err)
-	}
-	// 新建会话时顺手清一遍超期录音（保留期见 REC_KEEP_DAYS）
+	// 顺手清一遍超期录音（保留期见 REC_KEEP_DAYS）
 	go sweepRecFiles(rt.Settings.DataDirPath(), rt.Settings.RecKeepDays)
 
 	// 说话人区分：新 session 从零开始编号（sidecar 里若存着同 id 的旧状态也一并清掉）
 	rt.resetDiarize(sid)
 
 	rt.mu.Lock()
-	rt.sessionID = sid
-	rt.context = contextx.NewManager(rt.Store, materialsDir)
-	rt.agent = agent.NewRunner(rt.Settings, rt.context, rt.Store, rt.Display, rt.Bus)
-	// 每次点「开始 Session」都重新加载全局热词文件，改动即时生效（无需重启）
+	// 每次启动都重新加载全局热词文件，改动即时生效（无需重启）；会话级热词保留
 	rt.baseGlossary = asr.LoadHotwords(rt.Settings.HotwordsFile())
-	rt.sessionHotwords = map[string]int{}
-	merged := make(map[string]int, len(rt.baseGlossary))
+	merged := make(map[string]int, len(rt.baseGlossary)+len(rt.sessionHotwords))
 	for k, v := range rt.baseGlossary {
+		merged[k] = v
+	}
+	for k, v := range rt.sessionHotwords {
 		merged[k] = v
 	}
 	rt.glossary = merged

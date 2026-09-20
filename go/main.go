@@ -53,13 +53,15 @@ func main() {
 		log.Fatalf("内嵌前端资源异常: %v", err)
 	}
 
-	rt, err := server.NewRuntime(settings)
+	reg, err := server.NewRegistry(settings)
 	if err != nil {
 		log.Fatalf("初始化失败: %v", err)
 	}
-	defer rt.Close()
+	defer reg.Close()
+	// 保证至少有一个会场：保持「打开 /console 就能用」的单会场体验
+	reg.EnsureDefault()
 
-	srv := server.New(rt, sub)
+	srv := server.New(reg, sub)
 
 	addr := net.JoinHostPort(settings.Host, strconv.Itoa(settings.Port))
 	httpSrv := &http.Server{
@@ -79,7 +81,7 @@ func main() {
 	go func() {
 		<-stop
 		log.Printf("[seat] 收到退出信号，正在停止…")
-		rt.StopPipeline()
+		reg.Close() // 停止全部会场
 		_ = httpSrv.Close()
 	}()
 

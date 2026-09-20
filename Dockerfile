@@ -9,7 +9,8 @@
 #     -v "$PWD/sessions:/app/sessions" \
 #     translation-seat:latest
 #
-# 访问：控制台 http://<host>:8081/console ，投屏 http://<host>:8081/screen
+# 访问：控制台 http://<host>:8081/console（打开即新建会场并跳转 /<sid>/console）；
+#       投屏用控制台页脚显示的 /<sid>/screen（http://<host>:8081/screen 会落到最近会场）
 # 换端口：docker run -e PORT=9000 ...
 #
 # 说明：

@@ -1,10 +1,12 @@
 package server
 
 import (
+	"context"
 	"io/fs"
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -32,9 +34,14 @@ const (
 
 // Server HTTP/WebSocket 服务。
 type Server struct {
-	rt    *Runtime
+	reg   *Registry
 	webFS fs.FS
 	mux   *http.ServeMux
+
+	// cur 当前会场：无 sid 的入口（/console、/api/*、/ws/*）作用于它。
+	// 会场的 URL 路由（/<sid>/...）与前端绑定落地后，它退化为「最近活跃会场」的回落。
+	mu  sync.Mutex
+	cur *Runtime
 }
 
 var upgrader = websocket.Upgrader{
@@ -45,10 +52,50 @@ var upgrader = websocket.Upgrader{
 }
 
 // New 创建服务。webFS 为内嵌的前端静态资源（console.html / screen.html）。
-func New(rt *Runtime, webFS fs.FS) *Server {
-	s := &Server{rt: rt, webFS: webFS}
+func New(reg *Registry, webFS fs.FS) *Server {
+	s := &Server{reg: reg, webFS: webFS, cur: reg.Recent()}
 	s.mux = s.routes()
 	return s
+}
+
+// current 取本请求所属的会场：
+//   - 带 sid 的路由（/<sid>/...）由 withSession 解析后注入请求上下文；
+//   - 无 sid 的旧路由（兼容保留）回落到「当前会场」。
+func (s *Server) current(r *http.Request) *Runtime {
+	if rt, ok := r.Context().Value(rtCtxKey{}).(*Runtime); ok && rt != nil {
+		return rt
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cur
+}
+
+// rtCtxKey 请求上下文里存放「本请求所属会场」的键。
+type rtCtxKey struct{}
+
+// withSession 把路径参数 {sid} 解析为会场运行时（必要时按 DB 记录恢复）并注入上下文；
+// 会场不存在时返回 400。/<sid>/... 下的全部路由都经它进入。
+func (s *Server) withSession(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		sid := r.PathValue("sid")
+		rt, err := s.reg.Ensure(sid)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		if rt == nil {
+			writeErr(w, badRequest("会场不存在：%s", sid))
+			return
+		}
+		h(w, r.WithContext(context.WithValue(r.Context(), rtCtxKey{}, rt)))
+	}
+}
+
+// setCurrent 切换当前会场（新建/恢复会话时）。
+func (s *Server) setCurrent(rt *Runtime) {
+	s.mu.Lock()
+	s.cur = rt
+	s.mu.Unlock()
 }
 
 // Handler 返回 HTTP 处理器。
@@ -57,7 +104,7 @@ func (s *Server) Handler() http.Handler { return s.mux }
 func (s *Server) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 
-	// ---- 页面 ----
+	// ---- 入口（无 sid）----
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		// 挂在路径前缀下时（Kong base path + strip_path），后端看到的是去掉前缀的路径，
 		// 此时直接跳 /console 会让浏览器丢掉前缀、落到网关的其它路由上。
@@ -65,12 +112,61 @@ func (s *Server) routes() *http.ServeMux {
 		prefix := strings.TrimRight(r.Header.Get("X-Forwarded-Prefix"), "/")
 		http.Redirect(w, r, prefix+"/console", http.StatusFound)
 	})
-	mux.HandleFunc("GET /console", s.servePage("console.html"))
-	mux.HandleFunc("GET /screen", s.servePage("screen.html"))
-	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(s.webFS))))
+	// /console：新建会场并跳转 /<sid>/console（每个控制台页面绑定一个独立会场；
+	//          打开同一个 sid 的地址才是共享同一份状态）。
+	mux.HandleFunc("GET /console", s.handleConsoleEntry)
+	// /screen：跳转到「最近的会场」的投屏页（大屏不新建会场）。
+	mux.HandleFunc("GET /screen", s.handleScreenEntry)
 
-	// ---- REST ----
-	mux.HandleFunc("POST /api/session", s.handleCreateSession)
+	// ---- 会场页面 ----
+	// 注：原先的 GET /static/ 前缀路由已移除 —— 它没有任何实际资源（web 目录只有
+	// 两个 HTML，页面也未引用），而前缀模式与 /{sid}/console 互相覆盖，
+	// Go 1.22 ServeMux 会直接 panic（"/static/console" 两边都匹配）。
+	mux.HandleFunc("GET /{sid}/console", s.servePage("console.html"))
+	mux.HandleFunc("GET /{sid}/screen", s.servePage("screen.html"))
+
+	// ---- 会场 REST（/{sid}/api/...，由 withSession 注入本请求的会场）----
+	scoped := []struct {
+		method, path string
+		h            http.HandlerFunc
+	}{
+		{"POST", "/api/start", s.handleStartSession},
+		{"POST", "/api/stop", s.handleStopSession},
+		{"GET", "/api/export", s.handleExport},
+		{"GET", "/api/hotwords", s.handleGetHotwords},
+		{"PUT", "/api/hotwords", s.handlePutHotwords},
+		{"POST", "/api/hotwords/toggle", s.handleToggleHotwords},
+		{"POST", "/api/hotwords/generate", s.handleGenerateHotwords},
+		{"POST", "/api/materials/upload", s.handleUploadMaterial},
+		{"GET", "/api/materials", s.handleListMaterials},
+		{"GET", "/api/target-discipline", s.handleGetTargetDiscipline},
+		{"POST", "/api/target-discipline", s.handleSetTargetDiscipline},
+		{"GET", "/api/devices", s.handleDevices},
+		{"GET", "/api/speech/options", s.handleSpeechOptions},
+		{"GET", "/api/speakers", s.handleSpeakers},
+		{"POST", "/api/invoke", s.handleInvoke},
+		{"POST", "/api/invocation/{iid}/show", s.handleShow},
+		{"PATCH", "/api/invocation/{iid}", s.handleReviseInvocation},
+		{"POST", "/api/invocation/{iid}/discard", s.handleDiscard},
+		{"POST", "/api/invocation/{iid}/confirm", s.handleConfirm},
+		{"POST", "/api/kill", s.handleKill},
+		{"PATCH", "/api/segment/{segID}", s.handleReviseSegment},
+		{"GET", "/api/health", s.handleHealth},
+	}
+	for _, e := range scoped {
+		mux.HandleFunc(e.method+" /{sid}"+e.path, s.withSession(e.h))
+	}
+
+	// ---- 全局（不属于任何会场）----
+	mux.HandleFunc("POST /api/session", s.handleCreateSession) // 新建会场，返回新 sid
+	mux.HandleFunc("GET /api/sessions", s.handleListSessions)  // 活跃会场列表
+
+	// ---- 会场 WebSocket ----
+	mux.HandleFunc("GET /{sid}/ws/console", s.withSession(func(w http.ResponseWriter, r *http.Request) { s.serveWS(w, r, false) }))
+	mux.HandleFunc("GET /{sid}/ws/screen", s.withSession(func(w http.ResponseWriter, r *http.Request) { s.serveWS(w, r, true) }))
+	mux.HandleFunc("GET /{sid}/ws/audio", s.withSession(s.serveAudioWS))
+
+	// ---- 兼容：无 sid 的旧路由作用于「当前会场」（现有页面/脚本不受影响）----
 	mux.HandleFunc("POST /api/session/{sid}/start", s.handleStartSession)
 	mux.HandleFunc("POST /api/session/{sid}/stop", s.handleStopSession)
 	mux.HandleFunc("GET /api/session/{sid}/export", s.handleExport)
@@ -93,13 +189,56 @@ func (s *Server) routes() *http.ServeMux {
 	mux.HandleFunc("POST /api/kill", s.handleKill)
 	mux.HandleFunc("PATCH /api/segment/{segID}", s.handleReviseSegment)
 	mux.HandleFunc("GET /api/health", s.handleHealth)
-
-	// ---- WebSocket ----
 	mux.HandleFunc("GET /ws/console", func(w http.ResponseWriter, r *http.Request) { s.serveWS(w, r, false) })
 	mux.HandleFunc("GET /ws/screen", func(w http.ResponseWriter, r *http.Request) { s.serveWS(w, r, true) })
 	mux.HandleFunc("GET /ws/audio", s.serveAudioWS)
 
 	return mux
+}
+
+// handleConsoleEntry 无 sid 的控制台入口：新建一个会场并跳转到 /<sid>/console。
+// 这是刻意的设计——每个控制台页面绑定一个独立会场（sid 写进 URL）；
+// 打开同一个 sid 的地址则共享同一份状态（多人看同一个控制台）。
+func (s *Server) handleConsoleEntry(w http.ResponseWriter, r *http.Request) {
+	rt, err := s.reg.Create("Workshop", "", "", "", true)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	s.setCurrent(rt)
+	prefix := strings.TrimRight(r.Header.Get("X-Forwarded-Prefix"), "/")
+	http.Redirect(w, r, prefix+"/"+rt.SessionID()+"/console", http.StatusSeeOther)
+}
+
+// handleScreenEntry 无 sid 的大屏入口：跳转到「最近的会场」的投屏页。
+// 大屏是只读终端，不新建会场；要投某个会场的屏，直接用 /<sid>/screen。
+func (s *Server) handleScreenEntry(w http.ResponseWriter, r *http.Request) {
+	rt := s.reg.Recent()
+	if rt == nil {
+		rt = s.reg.EnsureDefault()
+	}
+	if rt == nil {
+		http.Error(w, "暂无会场", http.StatusNotFound)
+		return
+	}
+	prefix := strings.TrimRight(r.Header.Get("X-Forwarded-Prefix"), "/")
+	http.Redirect(w, r, prefix+"/"+rt.SessionID()+"/screen", http.StatusSeeOther)
+}
+
+// handleListSessions 当前活跃会场列表（含各自的控制台/投屏地址）。
+func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
+	items := make([]map[string]any, 0, DefaultMaxSessions)
+	for _, rt := range s.reg.List() {
+		sid := rt.SessionID()
+		items = append(items, map[string]any{
+			"session_id": sid,
+			"state":      string(rt.Display.State()),
+			"pipeline":   rt.PipelineAlive(),
+			"console":    "/" + sid + "/console",
+			"screen":     "/" + sid + "/screen",
+		})
+	}
+	writeJSON(w, 200, map[string]any{"items": items})
 }
 
 func (s *Server) servePage(name string) http.HandlerFunc {
@@ -116,8 +255,8 @@ func (s *Server) servePage(name string) http.HandlerFunc {
 }
 
 // snapshot 连接建立时补发的快照（只带最近 30 条历史）。
-func (s *Server) snapshot() events.Event {
-	hist := s.rt.Bus.Snapshot()
+func (s *Server) snapshot(rt *Runtime) events.Event {
+	hist := rt.Bus.Snapshot()
 	if len(hist) > 30 {
 		hist = hist[len(hist)-30:]
 	}
@@ -125,8 +264,8 @@ func (s *Server) snapshot() events.Event {
 	copy(evs, hist)
 	return events.Event{
 		"type":       "SNAPSHOT",
-		"state":      string(s.rt.Display.State()),
-		"session_id": s.rt.SessionID(),
+		"state":      string(rt.Display.State()),
+		"session_id": rt.SessionID(),
 		"events":     evs,
 	}
 }
@@ -140,11 +279,13 @@ func (s *Server) serveWS(w http.ResponseWriter, r *http.Request, screenOnly bool
 	}
 	defer conn.Close()
 
-	q := s.rt.Bus.Subscribe()
-	defer s.rt.Bus.Unsubscribe(q)
+	// 订阅本请求所属会场的事件总线：不同会场的事件天然隔离
+	rt := s.current(r)
+	q := rt.Bus.Subscribe()
+	defer rt.Bus.Unsubscribe(q)
 
 	_ = conn.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
-	if err := conn.WriteJSON(s.snapshot()); err != nil {
+	if err := conn.WriteJSON(s.snapshot(rt)); err != nil {
 		return
 	}
 
@@ -206,10 +347,13 @@ func (s *Server) serveAudioWS(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close()
 	conn.SetReadLimit(wsReadLimit)
 
+	// 音频只进本请求所属会场：/<sid>/ws/audio 与旧 /ws/audio（当前会场）都走这里
+	rt := s.current(r)
+
 	defer func() {
-		if bc, ok := s.rt.Capture().(*audio.BrowserCapture); ok {
+		if bc, ok := rt.Capture().(*audio.BrowserCapture); ok {
 			bc.MarkDisconnected()
-			s.rt.Bus.Publish(events.Event{"type": "MIC_STATUS", "status": "disconnected"})
+			rt.Bus.Publish(events.Event{"type": "MIC_STATUS", "status": "disconnected"})
 		}
 	}()
 
@@ -222,8 +366,8 @@ func (s *Server) serveAudioWS(w http.ResponseWriter, r *http.Request) {
 		if mt != websocket.BinaryMessage || len(data) == 0 {
 			continue
 		}
-		// 动态读取当前 capture：切换/重启 session 后音频不会喂到旧采集对象
-		bc, ok := s.rt.Capture().(*audio.BrowserCapture)
+		// 动态读取当前 capture：切换/重启流水线后音频不会喂到旧采集对象
+		bc, ok := rt.Capture().(*audio.BrowserCapture)
 		if !ok {
 			_ = conn.WriteMessage(websocket.CloseMessage,
 				websocket.FormatCloseMessage(4001, "流水线未开启浏览器收音"))
@@ -231,7 +375,7 @@ func (s *Server) serveAudioWS(w http.ResponseWriter, r *http.Request) {
 		}
 		if !bc.Connected() {
 			bc.MarkConnected()
-			s.rt.Bus.Publish(events.Event{"type": "MIC_STATUS", "status": "connected"})
+			rt.Bus.Publish(events.Event{"type": "MIC_STATUS", "status": "connected"})
 		}
 		bc.Feed(data)
 	}

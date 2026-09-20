@@ -182,6 +182,19 @@ func (s *Store) CreateSession(title, speaker, discipline string, aiEnabled bool,
 	return sid, nil
 }
 
+// HasSession 会话是否存在（按 sid 恢复会场运行时时用）。
+func (s *Store) HasSession(sid string) (bool, error) {
+	var one int
+	err := s.db.QueryRow("SELECT 1 FROM session WHERE id=?", sid).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // SetEnded 标记会话结束。
 func (s *Store) SetEnded(sid string) error {
 	_, err := s.db.Exec("UPDATE session SET ended_at=? WHERE id=?", now(), sid)

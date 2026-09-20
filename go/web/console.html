@@ -190,6 +190,7 @@
   <span id="spkStatus">说话人: -</span>
   <span id="sessionInfo">未开始</span>
   <span class="sp"></span>
+  <span id="castLink" style="cursor:pointer"></span>
   <span id="callCount">调用 0 次</span>
 </footer>
 <script>
@@ -688,6 +689,25 @@ if($("targetDiscipline")){
 try{
   $("transcript").addEventListener("scroll",()=>{ transcriptFollow=atBottom($("transcript")); });
   $("speechCard").addEventListener("scroll",()=>{ speechFollow=atBottom($("speechCard")); });
+}catch(e){ console.error(e); }
+// 本会场的投屏地址（/<sid>/screen）：显示在页脚 + 点击复制。
+// 一个控制台页面绑定一个会场（sid 在 URL 里），这里显示的就是「本页操作会投到哪块屏」；
+// 不同 sid 的会场互相隔离，各自的投屏地址也互不影响。
+try{
+  const castURL=location.origin+BASE+"/screen";
+  const cel=$("castLink");
+  if(cel){
+    cel.textContent="投屏: "+BASE+"/screen";
+    cel.title="点击复制本会场投屏地址（大屏只读，多会场互不影响）："+castURL;
+    cel.onclick=()=>{
+      if(navigator.clipboard&&navigator.clipboard.writeText){
+        navigator.clipboard.writeText(castURL).then(()=>{
+          cel.textContent="已复制投屏地址";
+          setTimeout(()=>{ cel.textContent="投屏: "+BASE+"/screen"; },1500);
+        }).catch(()=>{});
+      }
+    };
+  }
 }catch(e){ console.error(e); }
 // 初始化：WS 已在文件开头建立；其余各自隔离，任一失败不影响其它
 try{ loadHotwords(); }catch(e){ console.error(e); }

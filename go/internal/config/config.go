@@ -51,6 +51,11 @@ type Settings struct {
 	LLMMaxTokens   int
 	LLMTemperature float64
 	LLMChatPath    string
+	// LLMReasoningEffort 思考开关（OpenAI 兼容字段 reasoning_effort）：空=不发送、
+	// 用模型默认行为（思考模型会先思考再出正文）；"no_think"=关闭思考（hy 系列）。
+	// 思考阶段只流 reasoning_content 且客户端会丢弃，首字要等 10~30s；关掉后
+	// 正文 delta 直接开始流。
+	LLMReasoningEffort string
 
 	// 讲稿文档解析（上传演示稿 → 抽热词 + 生成上下文摘要）
 	DocParseURL    string // /parse_doc 服务地址
@@ -66,6 +71,10 @@ type Settings struct {
 	DiarizeTimeout   float64
 	DiarizeThreshold float64
 	DiarizeMinMS     int
+	// DiarizeMaxSegS 说话人区分的音频段最长秒数（与 ASR 的 MAX_SEGMENT_S 分开）。
+	// 段内混入多人声音时声纹 embedding 变成混合体，聚类会把不同人并成一个编号；
+	// 多人接话的会议里 15s 强切段几乎必然混合，5~8s 是较好的折中。
+	DiarizeMaxSegS int
 	// DiarizeAutostart 启动时自动拉起 sidecar（tools/diarize/run.sh，首次运行会装依赖+下模型）。
 	// 仅在 DiarizeURL 指向本机、且脚本存在时生效；起不来只记日志，不影响转写。
 	DiarizeAutostart bool
@@ -127,13 +136,14 @@ func Load() *Settings {
 		RefineEnabled:  envBool("REFINE_ENABLED", true),
 		RefineMinChars: envInt("REFINE_MIN_CHARS", 12),
 
-		LLMBase:        envStr("LLM_BASE", ""),
-		LLMKey:         envStr("LLM_KEY", ""),
-		LLMModel:       envStr("LLM_MODEL", ""),
-		LLMTimeout:     envFloat("LLM_TIMEOUT", 30.0),
-		LLMMaxTokens:   envInt("LLM_MAX_TOKENS", 4000),
-		LLMTemperature: envFloat("LLM_TEMPERATURE", 0.3),
-		LLMChatPath:    envStr("LLM_CHAT_PATH", ""),
+		LLMBase:            envStr("LLM_BASE", ""),
+		LLMKey:             envStr("LLM_KEY", ""),
+		LLMModel:           envStr("LLM_MODEL", ""),
+		LLMTimeout:         envFloat("LLM_TIMEOUT", 30.0),
+		LLMMaxTokens:       envInt("LLM_MAX_TOKENS", 4000),
+		LLMTemperature:     envFloat("LLM_TEMPERATURE", 0.3),
+		LLMChatPath:        envStr("LLM_CHAT_PATH", ""),
+		LLMReasoningEffort: envStr("LLM_REASONING_EFFORT", ""),
 
 		// 默认值与 contextx 包内的常量一致（此处写字面量以保持 config 不反向依赖业务包）
 		DocParseURL:    envStr("DOC_PARSE_URL", "https://ml-serv.ssv.qq.com/parse_doc"),
@@ -149,6 +159,7 @@ func Load() *Settings {
 		DiarizeTimeout:   envFloat("DIARIZE_TIMEOUT", 20.0),
 		DiarizeThreshold: envFloat("DIARIZE_THRESHOLD", 0.5),
 		DiarizeMinMS:     envInt("DIARIZE_MIN_MS", 600),
+		DiarizeMaxSegS:   envInt("DIARIZE_MAX_SEG_S", 6),
 		DiarizeAutostart: envBool("DIARIZE_AUTOSTART", true),
 		DiarizeDebug:     envBool("DIARIZE_DEBUG", false),
 

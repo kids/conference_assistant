@@ -203,6 +203,34 @@ func (rt *Runtime) ApplyRevision(segID, text, source string) {
 	})
 }
 
+// fillerRunes 纯语气词/填充音。ASR 在轻声、远场、迟疑、噪声处常吐出这类极短句
+// （「嗯。」「呃。」），单条没有信息量，却会持续堆砌转写区、干扰阅读。
+var fillerRunes = map[rune]bool{
+	'嗯': true, '呃': true, '哦': true, '噢': true, '唔': true, '唉': true,
+	'哎': true, '诶': true, '啊': true, '呀': true, '哈': true, '呵': true,
+	'嘿': true, '哼': true, '咦': true, '唷': true, '呦': true, '嘛': true,
+}
+
+// isFillerOnly 判断整句是否为纯语气词短句（「嗯。」「呃呃。」）。
+// 判定从严：只由语气词（≤4 个）与标点组成才算 —— 句中出现任何实义字
+// （「嗯，但是这样不行」）都不算，照常保留。
+func isFillerOnly(text string) bool {
+	n := 0
+	for _, r := range text {
+		if fillerRunes[r] {
+			n++
+			continue
+		}
+		switch r {
+		case '。', '，', '、', '！', '？', '…', '～', '~', ' ', '!', '?', '.', ',':
+			// 标点与空白不计
+		default:
+			return false
+		}
+	}
+	return n > 0 && n <= 4
+}
+
 // makeHandlers 构造 ASR 回调。
 func (rt *Runtime) makeHandlers() asr.Handlers {
 	return asr.Handlers{
@@ -219,6 +247,11 @@ func (rt *Runtime) makeHandlers() asr.Handlers {
 			}
 			text = strings.TrimSpace(text)
 			if text == "" {
+				return
+			}
+			if isFillerOnly(text) {
+				// 纯语气词短句（「嗯。」等）：不入库、不上屏 —— ASR 在轻音处会持续吐，
+				// 堆砌转写区。判定极保守（见 isFillerOnly），带任何实义字都不丢。
 				return
 			}
 
@@ -395,8 +428,10 @@ func (rt *Runtime) StartPipeline(replayPath, captureMode string) (map[string]any
 	if rt.diarizer != nil {
 		monitor := vad
 		if monitor == nil {
+			// 段长用 DiarizeMaxSegS 而非 ASR 的 MaxSegmentS：15s 的强切段在多人接话时
+			// 会把几个人的声音混进同一段，声纹聚类随之失效（不同人被并成一个编号）。
 			if v, err := audio.NewVadSegmenter(s.SampleRate, s.FrameMS, s.VADSilenceMS,
-				s.VADAggressiveness, s.MaxSegmentS); err == nil {
+				s.VADAggressiveness, s.DiarizeMaxSegS); err == nil {
 				monitor = v
 			} else {
 				log.Printf("[diarize] 监测 VAD 初始化失败，本场不产出说话人标记: %v", err)

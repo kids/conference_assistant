@@ -9,27 +9,14 @@
 - **说话人区分**：CAM++ sidecar 逐句判定说话人，控制台/大屏在句子上方标注「说话人 N」，换人处画分隔线（见下文「说话人区分」）；
 - **发言**：中栏填「立场」+ 选语言/长度 → 结合会议上下文生成发言稿，展示在右下角（见下文「发言」）。
 
-## 两种实现
+## 实现
 
-本仓库有两套**功能等价、接口兼容**的实现：
+**单一实现：Go 版（`go/`）** —— 即 `Dockerfile` 构建的默认部署版本；前端页面 `go:embed` 进二进制，运行镜像无需静态文件。
 
-> **Python 版（`app/`）已封板（deprecated）** —— 自 2026-09 起不再新增功能，代码保留、暂不删除。
-> **所有新改动只进 Go 版（`go/`）**，即 `Dockerfile` 构建的默认部署版本。
-> 保留它的唯一目的是：Go 版出现疑难问题时，可切回 Python 版对照定位。
-> **不要在其上开发新功能** —— 两版已经出现行为差异（见下文「与 Python 版的已知行为差异」）。
+> 早期的 Python 版（`app/`）已于 2026-09 随 Go 版稳定后**整体移除**（历史可查 git 提交），
+> 以免两套实现重复维护。下文仍出现「Python 版」字样的段落，均为保留的设计对照记录，非现役代码。
 
-|  | **Go 版**（`go/`） | Python 版（`app/`，已封板） |
-|---|---|---|
-| 定位 | **默认部署版本**（`Dockerfile` 构建它） | **已封板**：只读保留，作对照与应急回退 |
-| 前端页面 | 同一套页面，`go:embed` 进二进制（`go/web/` 与 `app/web/` 逐字一致） | 从磁盘读取 |
-| HTTP / WebSocket 接口 | 与 Python 版完全一致 | — |
-| SQLite 表结构 | 与 Python 版完全一致，可共用同一份 `sessions/transcript.sqlite` | 同 |
-| 并发模型 | goroutine + channel + context；ASR 重连为异步，不阻塞音频链路 | 线程 + asyncio + 跨线程事件投递 |
-| 运行镜像 | 116 MB | 314 MB |
-
-因为接口完全一致，**前端页面与 `使用说明.md` 的操作流程对两者通用**。
-
-## 快速开始（Go 版，推荐）
+## 快速开始
 
 ```bash
 cd go
@@ -42,7 +29,7 @@ cp ../.env.example ../.env      # 首次：填写 LLM_BASE / LLM_KEY / LLM_MODEL
 - 操作员控制台：<http://127.0.0.1:8080/console>
 - 会场投屏大屏：<http://127.0.0.1:8080/screen>
 
-配置查找顺序：`BASE_DIR` 环境变量 → 当前目录 `.env` → 上级目录 `.env`（即仓库根的 `.env`，与 Python 版共用）。环境变量优先于 `.env`：
+配置查找顺序：`BASE_DIR` 环境变量 → 当前目录 `.env` → 上级目录 `.env`（即仓库根的 `.env`）。环境变量优先于 `.env`：
 
 ```bash
 HOST=0.0.0.0 PORT=8081 ./seat                    # 换绑定地址/端口（容器部署常用）
@@ -56,7 +43,7 @@ Go 版有 4 个 cgo 依赖，需要 `gcc` / `g++`：
 
 | 依赖 | 用途 |
 |---|---|
-| `maxhawkins/go-webrtcvad` | VAD 断句。与 Python 版使用**同一个 webrtcvad C 库**，阈值语义一致 |
+| `maxhawkins/go-webrtcvad` | VAD 断句（webrtcvad C 库） |
 | `yanyiwu/gojieba` | 中文分词 + 词性标注（C++） |
 | `mattn/go-sqlite3` | SQLite 驱动 |
 | `gen2brain/malgo` | 本机声卡采集（miniaudio，运行时通过 dlopen 加载 ALSA，故 `libasound2` 非必需） |
@@ -65,19 +52,19 @@ Go 版有 4 个 cgo 依赖，需要 `gcc` / `g++`：
 
 - 本地开发（模块缓存完整）通常**无需设置**；
 - 容器或分发场景，请把词典目录（含 `pos_dict/` 子目录）与二进制一起带上，并用 `JIEBA_DICT_DIR` 指向它；
-- 词典缺失时程序**降级为按标点切分**（对齐 Python 版 jieba 不可用时的行为），不会中断服务。
+- 词典缺失时程序**降级为按标点切分**，不会中断服务。
 
-### 与 Python 版的已知行为差异
+### 设计取舍记录（对照已移除的 Python 版）
 
-均为有意设计，非缺陷：
+以下均为有意设计，非缺陷：
 
 1. **重连期间丢帧**，而非阻塞排队后补发。Python 版在退避重连时持锁休眠（最坏约 25s）并让音频链路停摆，Go 版改为异步重连 + 有界丢帧，实时性优先。
 2. **流水线启动时预热 ASR 连接**，避免开头几百毫秒音频因"首次发送才建连"被丢弃。
 3. **读空闲超时 3 分钟**。Python 版底层 `websocket-client` 的 socket 超时为 10s，静默连接会被误判断开。
 4. **中文分词边界个别句子不同**：gojieba 与 Python jieba 同源但非逐字一致，实测 10 句样本中 6 句完全相同；差异处各有得失（`带隙`/`隧穿` 被合并成词反而多识别出术语，`X射线` 被拆开少识别一个），净效果基本中性。
 5. `GET /api/devices` 改用 malgo 枚举，返回字段与 Python 版的 sounddevice 不同（仅调试接口）。
-6. **前端页面已分叉**：`go/web/` 比 `app/web/` 多出「说话人标记」与「发言/发言稿」两块（Python 版已封板，不再跟进）。
-   两者的 DOM 引用仍由 `go/web_assets_test.go` 一并守住（该测试会把 `app/web` 也扫一遍）。
+6. **前端页面在 Python 版封板后继续演进**：现役 `go/web/` 比当年的 `app/web/` 多出「说话人标记」与「发言/发言稿」两块。
+   DOM 引用（JS 引用的 id 必须真实存在）由 `go/web_assets_test.go` 钉住。
 
 ## 说话人区分（CAM++ sidecar）
 
@@ -114,6 +101,7 @@ DIARIZE_ENABLED=false      # 打开开关
 DIARIZE_URL=http://127.0.0.1:18901
 DIARIZE_THRESHOLD=0.5      # 同人判定阈值：同一个人被拆成多个编号→调小；不同人并成一个→调大
 DIARIZE_MIN_MS=600         # 过短语音段不判定
+DIARIZE_MAX_SEG_S=6        # 音频段最长秒数：多人接话时 15s 段会混入多人的声音，不同人容易被并成一个编号
 DIARIZE_TIMEOUT=20
 DIARIZE_AUTOSTART=true     # 不可达时自动执行 run.sh（仅本机 URL）
 ```
@@ -145,29 +133,10 @@ sidecar 侧日志在主程序数据目录下（`sessions/diarize.log`，由自�
 - 右下角的稿子可直接编辑（失焦保存）、**重生成**、**复制**、**投屏**。
   投到大屏时角标会变成「AI 起草发言稿 · 供发言人修改使用」，留屏 2 分钟（翻译任务是 30 秒）。
 
-## 快速开始（Python 版，已封板）
-
-> 仅用于**对照排查**或应急回退，不要在其上开发新功能。生产部署请用上面的 Go 版。
-
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-
-cp .env.example .env
-# 编辑 .env：填写 LLM_BASE / LLM_KEY / LLM_MODEL；按需调整 FUNASR_SERV / FUNASR_WS_URL
-
-./run.sh          # 或 uvicorn app.main:app --host 127.0.0.1 --port 8080
-```
-
-`run.sh` 默认绑定 `0.0.0.0:8081`（避开常被 IDE 占用的 8080），并带 `--reload`。启动时会打印一行封板告警。
-
 ## Docker 部署
 
 ```bash
-# Go 版（默认）
 docker build -t translation-seat:latest .
-# Python 版（已封板，仅对照用）
-docker build -f Dockerfile.python -t translation-seat:py .
 
 docker run -d --name translation-seat -p 8081:8081 \
   -v "$PWD/.env:/app/.env:ro" \
@@ -231,13 +200,15 @@ DIARIZE_ENABLED=true DIARIZE_AUTOSTART=false ./seat
 
 ## 环境检查
 
+服务启动后，用健康接口查看 ASR / LLM / 收音 / 说话人状态（页面页脚也实时显示）：
+
 ```bash
-python tools/check_env.py        # Python 版
+curl -s http://127.0.0.1:8081/api/health
 ```
 
 ## 关键配置（.env）
 
-两套实现共用同一份 `.env`（字段名与默认值一致）。
+字段名与默认值见 `.env.example`。
 
 | 变量 | 说明 |
 |---|---|
@@ -253,9 +224,10 @@ python tools/check_env.py        # Python 版
 | `LOCAL_VAD_SEGMENT` | `funasr_nano` 是否用本地 VAD 主动切句（句尾静音即发 STOP，出字更快）。关闭则退回服务端 VAD（实测 10~20s 才出一句） |
 | `LLM_BASE` | taiji LLM 端点（即完整端点，不再拼接 `/v1/chat/completions`） |
 | `LLM_KEY` | API Key |
-| `LLM_MODEL` | 模型名，默认 `hy3` |
-| `LLM_TIMEOUT` | 单次调用超时。**注意**：`hy3` 是思考模型，长 prompt（如热词生成）思考需 28~37s，该值偏小会导致随机超时；热词生成已在代码内单独给 90s |
-| `LLM_MAX_TOKENS` | 生成预算。`hy3` 的 `reasoning_content` 与正文**共享**该预算，过小会导致正文为空 |
+| `LLM_MODEL` | 模型名，当前 `hy4-preview` |
+| `LLM_REASONING_EFFORT` | 思考开关：`no_think` 关闭思考（hy 系列）。思考阶段只流 `reasoning_content`（客户端丢弃），首字要等 10~30s；关掉后正文直接开始流。留空=模型默认（思考） |
+| `LLM_TIMEOUT` | 单次调用超时。**注意**：思考模式下长 prompt（如热词生成）思考需 28~37s，该值偏小会导致随机超时；热词生成已在代码内单独给 90s |
+| `LLM_MAX_TOKENS` | 生成预算。思考模式下模型 `reasoning_content` 与正文**共享**该预算，过小会导致正文为空；`no_think` 后不再共享 |
 | `LLM_CHAT_PATH` | 端点后缀，taiji 留空；标准 OpenAI 服务填 `/v1/chat/completions` |
 | `SPEECH_MAX_TOKENS` | 「发言」的单次生成预算（默认 6000）。发言稿最长 2 分钟，比短翻译长得多 |
 | `DIARIZE_ENABLED` | 是否开启说话人区分（默认 false）。开启需要 Python 环境跑 CAM++ sidecar |
@@ -263,7 +235,7 @@ python tools/check_env.py        # Python 版
 | `DIARIZE_THRESHOLD` | 同一说话人判定阈值（余弦，默认 0.5）：同人被拆开→调小，不同人并一起→调大 |
 | `DIARIZE_MIN_MS` | 过短的语音段不做判定（默认 600ms） |
 | `DIARIZE_TIMEOUT` | 单段声纹判定超时（秒，默认 20） |
-| `DIARIZE_AUTOSTART` | sidecar 不可达时自动执行 `tools/diarize/run.sh`（默认 true，仅本机 URL） |
+| `DIARIZE_AUTOSTART` | sidecar 不可达时自动拉起（优先 Go 版 `tools/diarize-go/seat-diarize`，其次 Python 版 `tools/diarize/run.sh`；默认 true，仅本机 URL） |
 | `DIARIZE_DEBUG` | 打印每段语音的判定与配对决策（默认 false，排查编号乱跳时打开） |
 | `HOTWORDS_PATH` | 全局热词兜底（可留空，会前按科学家自动生成 session 专属热词） |
 
@@ -297,15 +269,11 @@ python tools/check_env.py        # Python 版
 ## 目录
 
 ```
-app/            Python 版（FastAPI：audio 采集/断句、asr 流式、context、agent、providers）—— 已封板
-app/web/        console.html / screen.html（零框架原生前端，已封板不再跟进新功能）
-go/             Go 版（internal/{config,events,state,store,llm,asr,audio,contextx,agent,diarize,server}）
-go/web/         在 app/web/ 基础上多了「说话人标记」与「发言/发言稿」，编译时 embed 进二进制
+go/             Go 版主程序（internal/{config,events,state,store,llm,asr,audio,contextx,agent,diarize,server}）
+go/web/         console.html / screen.html（零框架原生前端，编译时 embed 进二进制）
 go/tools/mockasr  本地假 ASR 服务（离线验证整条流水线）
-Dockerfile      Go 版镜像（默认）
-Dockerfile.python  Python 版镜像（已封板，仅对照用）
+Dockerfile      Go 版镜像
 sessions/       运行数据（SQLite 转写库、session 资料、复盘导出、
                 <sid>/speakers.json 说话人表、diarize.log sidecar 日志）
-tools/          check_env.py 环境自检（Python 版）
 tools/diarize/  CAM++ 说话人区分 sidecar（run.sh 运行时装依赖+下模型；server.py 可 --mock 联调）
 ```

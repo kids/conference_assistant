@@ -95,8 +95,9 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	if body.AIEnabled != nil {
 		aiEnabled = *body.AIEnabled
 	}
-	// 新 session 从表单取值；未传则回到默认「白话」
-	s.rt.SetTargetDiscipline(body.TargetDiscipline)
+	// 新 session 从表单取值；未传则回到默认「白话」。
+	// 非法值不阻断开会：回退为当前值（校验失败原因由 /api/target-discipline 单独提示）。
+	_, _ = s.rt.SetTargetDiscipline(body.TargetDiscipline)
 
 	res, err := s.rt.CreateSession(body.Title, body.Speaker, body.Institution, body.Discipline,
 		aiEnabled, body.ReplayPath, body.Capture)
@@ -552,7 +553,12 @@ func (s *Server) handleSetTargetDiscipline(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, 400, map[string]any{"error": "请求体解析失败: " + err.Error()})
 		return
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "discipline": s.rt.SetTargetDiscipline(body.Discipline)})
+	v, err := s.rt.SetTargetDiscipline(body.Discipline)
+	if err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "discipline": v})
 }
 
 func (s *Server) handleShow(w http.ResponseWriter, r *http.Request) {

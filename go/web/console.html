@@ -55,6 +55,15 @@
   .task{text-align:left;padding:9px;font-size:13px;line-height:1.3}
   .task small{display:block;color:var(--dim);font-weight:400;margin-top:2px}
   input[type=text]{width:100%;background:#14161a;border:1px solid var(--line);color:var(--txt);border-radius:6px;padding:8px 10px;font-size:13px;margin-bottom:8px}
+  /* 浏览器自动填充（autofill）：Chrome/Safari 会把被判定为可填充的输入框涂成自己的背景色
+     （深色主题下就是一块突兀的黑斑），且优先级高于普通样式。用内阴影把背景盖回页面同色，
+     文字与光标颜色一并还原（1000px 内阴影 + 超长 transition 是通行的覆盖写法）。 */
+  input:-webkit-autofill,input:-webkit-autofill:hover,input:-webkit-autofill:focus{
+    -webkit-box-shadow:0 0 0 1000px #14161a inset;
+    -webkit-text-fill-color:var(--txt);
+    caret-color:var(--txt);
+    transition:background-color 9999s ease-in-out 0s;
+  }
   /* AI 卡 */
   #aiCard{background:#14161a;border:1px solid var(--line);border-radius:8px;padding:14px;min-height:180px;font-size:15px;line-height:1.7;white-space:pre-wrap}
   #aiCard .state{color:var(--dim);font-style:italic}
@@ -115,8 +124,8 @@
         <button class="task" data-task="BRIDGE">4 桥接提问<small>跨学科连接</small></button>
         <button class="task" data-task="SUMMARY">5 报告总结<small>通俗总结</small></button>
       </div>
-      <input type="text" id="targetDiscipline" placeholder="目标学科（默认「白话」，即讲给非专业听众）" title="把 AI 输出翻译到该学科的表达层次：可直接输入自定义学科，回车或失焦生效；留空按「白话」处理。与「报告人学科」不同，这里指的是「讲给谁听」。">
-      <input type="text" id="target" placeholder="目标术语/问题（可选）">
+      <input type="text" id="targetDiscipline" autocomplete="off" placeholder="目标学科（默认「白话」，即讲给非专业听众）" title="把 AI 输出翻译到该学科的表达层次：可直接输入自定义学科，回车或失焦生效；留空按「白话」处理。与「报告人学科」不同，这里指的是「讲给谁听」。">
+      <input type="text" id="target" autocomplete="off" placeholder="目标术语/问题（可选）">
       <h2 style="padding:6px 0 8px;border:none">候选术语（点击即解释）</h2>
       <div id="terms"></div>
     </div>
@@ -657,6 +666,9 @@ async function loadTargetDiscipline(){
   try{ const r=await fetch(BASE+"/api/target-discipline").then(r=>r.json());
     const v=(r&&r.discipline)||"";
     if(document.activeElement!==td) td.value=(v===DISCIPLINE_DEFAULT)?"":v;
+    // 非默认值时显式提示当前生效值：服务端保存的学科会拼进每一次 AI 调用，
+    // 误输入/浏览器自动填充留下的值若不可见，会一直在后台影响所有任务
+    if(v && v!==DISCIPLINE_DEFAULT) $("sessionInfo").textContent="当前目标学科："+v;
   }catch(e){}
 }
 async function applyTargetDiscipline(){
@@ -664,7 +676,7 @@ async function applyTargetDiscipline(){
   const v=td.value.trim()||DISCIPLINE_DEFAULT;
   td.value=(v===DISCIPLINE_DEFAULT)?"":v;   // 回到默认就清空，交回 placeholder
   const r=await post("/api/target-discipline",{discipline:v}).catch(()=>null);
-  $("sessionInfo").textContent=(r&&r.ok)?("目标学科："+r.discipline):"目标学科切换失败";
+  $("sessionInfo").textContent=(r&&r.ok)?("目标学科："+r.discipline):("目标学科未生效"+((r&&r.error)?("："+r.error):""));
 }
 // 元素存在才绑定。将来若再漏加元素，最坏只丢这一个功能，不会连累后面的初始化（这正是上次
 // 「卡在启动中」的成因：一行 null.onchange 抛错，把 connect() 一起带走了）

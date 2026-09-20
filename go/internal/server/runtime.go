@@ -130,15 +130,25 @@ func (rt *Runtime) TargetDiscipline() string {
 }
 
 // SetTargetDiscipline 设置目标学科，返回归一化后的值。下一次 AI 调用即生效。
-func (rt *Runtime) SetTargetDiscipline(v string) string {
+// 该值会拼进**每一次** AI 调用的「翻译目标学科」块（含报告总结），因此做基本校验：
+// 空值回默认；长度须 2~20 字；不允许换行/制表符 —— 防止误输入或浏览器自动填充的
+// 异常文本（如「黑背影」）进入所有任务的上下文。校验不过时保持原值并返回错误。
+func (rt *Runtime) SetTargetDiscipline(v string) (string, error) {
 	v = strings.TrimSpace(v)
 	if v == "" {
 		v = DefaultTargetDiscipline
+	} else {
+		if n := len([]rune(v)); n < 2 || n > 20 {
+			return rt.TargetDiscipline(), fmt.Errorf("目标学科应为 2~20 字（收到 %d 字），未生效", n)
+		}
+		if strings.ContainsAny(v, "\n\r\t") {
+			return rt.TargetDiscipline(), fmt.Errorf("目标学科不能包含换行或制表符，未生效")
+		}
 	}
 	rt.mu.Lock()
 	rt.targetDiscipline = v
 	rt.mu.Unlock()
-	return v
+	return v, nil
 }
 
 // Close 释放运行时资源。

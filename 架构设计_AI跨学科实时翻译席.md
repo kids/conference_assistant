@@ -149,14 +149,18 @@
 
 - `TranscriptStore`：按 session 顺序存 `Segment{ id, t_start, t_end, track, speaker_hint, text, revised_text, is_final }`。
   - 操作员可在控制台**行内修正**术语/人名错识 → 写 `revised_text`，LLM 只读修正后文本（对应需求"ASR 识别错误"控制措施）。
-- `ContextManager` 组装 LLM 输入，分四块并做预算控制（总 ≤ 6k tokens）：
+- `ContextManager` 组装 LLM 输入，分四块并做预算控制（限额按字符数，中文下与 token 同量级）：
 
 | 块 | 内容 | 来源 | 预算 |
 |---|---|---|---|
-| STATIC | 报告摘要、PPT 文本、报告人简介、session 主题、术语表 | 会前 `sessions/<id>/materials/` 目录（.md/.txt/.pdf→文本/.pptx→文本） | ≤ 2.5k |
-| RECENT | 最近 **30 分钟**转写（超出按段落做压缩摘要，滚动淘汰） | TranscriptStore | ≤ 2.5k |
-| FOCUS | 最近 **60 秒**原文逐字 + 操作员用鼠标框选的目标句 | TranscriptStore / UI 选区 | ≤ 0.6k |
-| HISTORY | 本场已展示过的 AI 输出（防重复解释同一术语） | InvocationStore | ≤ 0.4k |
+| STATIC | 报告摘要、PPT 文本、报告人简介、session 主题、术语表 | 会前 `sessions/<id>/materials/` 目录（.md/.txt/.pdf→文本/.pptx→文本） | ≤ 6k |
+| RECENT | **本场全部**转写（超预算保留最新，见下方注记） | TranscriptStore | ≤ 40k |
+| FOCUS | 最近 **60 秒**原文逐字 + 操作员用鼠标框选的目标句 | TranscriptStore / UI 选区 | ≤ 2k |
+| HISTORY | 本场已展示过的 AI 输出（防重复解释同一术语） | InvocationStore | ≤ 2k |
+
+> 实现注记（Go 版）：RECENT 取消 30 分钟时间窗与滚动压缩 —— 直接取本场全部转写，
+> 超出预算时**保留最新**（丢最早）。目的是让「报告总结」这类全场任务拿到完整且最新的内容，
+> 避免长会议里"总结依据的其实是会议开头内容"这类失真。
 
 - **术语候选提取**（给操作员减负）：final 段落到达后，用轻量规则实时打分并推给控制台"候选术语区"：
   - 命中会前术语表/session 专属热词 → 高分；

@@ -221,7 +221,7 @@ func buildMessages(task Task, target string, c contextx.Context, targetDisciplin
 	}
 	userParts := []string{
 		"【会议材料（摘要/PPT/术语表）】\n" + orNone(c.Static),
-		"【最近 30 分钟转写（语音识别自动转写，可能有识别错误）】\n" + orNone(c.Recent),
+		"【本场转写（语音识别自动转写，可能有识别错误）】\n" + orNone(c.Recent),
 	}
 	if c.Focus != "" {
 		userParts = append(userParts, "【当前焦点（主持人框选/最近 60 秒）】\n"+c.Focus)
@@ -257,7 +257,7 @@ func buildSpeechMessages(opts SpeechOptions, c contextx.Context, targetDisciplin
 	}
 	userParts := []string{
 		"【会议材料（摘要/PPT/术语表）】\n" + orNone(c.Static),
-		"【最近 30 分钟转写（语音识别自动转写，可能有识别错误）】\n" + orNone(c.Recent),
+		"【本场转写（语音识别自动转写，可能有识别错误）】\n" + orNone(c.Recent),
 	}
 	if c.Focus != "" {
 		userParts = append(userParts, "【当前焦点（最近 60 秒）】\n"+c.Focus)

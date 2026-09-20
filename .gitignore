@@ -18,6 +18,10 @@ go/seat
 go/mockasr
 go/bin/
 
+# seat-diarize（Go 版说话人 sidecar）：第三方库与模型不入库，由 fetch_deps.sh 拉取
+tools/diarize-go/third_party/
+tools/diarize-go/seat-diarize
+
 # 运行数据（会话转写记录）
 sessions/
 

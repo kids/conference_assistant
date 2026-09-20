@@ -283,12 +283,14 @@ class MockEmbedder:
 # --------------------------------------------------------------------------
 class Service:
     def __init__(self, embedder, threshold: float, min_ms: int, state_dir: str | None,
-                 default_dir: str | None):
+                 default_dir: str | None, save_audio: bool = False):
         self.embedder = embedder
         self.threshold = threshold
         self.min_ms = min_ms
         self.state_dir = state_dir
         self.default_dir = default_dir
+        self.save_audio = save_audio   # 调试：把每段音频与判定结果落盘（DIARIZE_SAVE_AUDIO=1）
+        self.save_seq = 0
         self.sessions: dict[str, SessionState] = {}
         self.lock = threading.Lock()
         self.infer_lock = threading.Lock()   # 串行推理：torch 在多线程下并发无收益
@@ -331,12 +333,52 @@ class Service:
             res = st.assign(emb, seconds)
         self.calls += 1
         st.save()
+        if self.save_audio:
+            try:
+                self._save_segment(sid, sess_dir, pcm, res, emb)
+            except Exception as e:      # 保存失败不影响判定主链路
+                print(f"[diarize] 保存音频失败: {e}", flush=True)
         # 每次判定留一行日志：现场排查（编号乱跳/标记缺失）时这是唯一能看到
         # "同一段音频被判成谁"的地方，主程序侧只保留了聚合计数。
         print(f"[diarize] {sid} {seconds:5.1f}s → {res.get('speaker') or '-'} "
               f"conf={res.get('confidence')} new={res.get('is_new')} "
               f"本场 {res.get('speaker_count')} 人", flush=True)
         return res
+
+    # ---- 调试用：音频落盘（--save-audio / DIARIZE_SAVE_AUDIO=1）----
+    def _save_segment(self, sid: str, sess_dir: str | None, pcm: bytes, res: dict, emb):
+        """把每段音频（WAV）与判定结果（index.jsonl，含 embedding）存到 <会话目录>/audio/。
+
+        用途：离线分析「谁是谁」、重算相似度矩阵、定量验证阈值 —— 现场仅看日志数值
+        不够时用。生产环境应保持关闭（音频含会议内容，注意隐私与磁盘占用：
+        16k/mono ≈ 32KB/s）。
+        """
+        import wave
+
+        base = sess_dir or self.state_dir or "."
+        outdir = os.path.join(base, "audio")
+        os.makedirs(outdir, exist_ok=True)
+        with self.lock:
+            self.save_seq += 1
+            seq = self.save_seq
+        conf = res.get("confidence")
+        spk = res.get("speaker") or "none"
+        name = f"seg{seq:04d}_{spk}_conf{conf if conf is not None else '-'}.wav"
+        with wave.open(os.path.join(outdir, name), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(16000)
+            w.writeframes(pcm)
+        meta = {
+            "seq": seq, "file": name, "session": sid, "ts": round(time.time(), 2),
+            "seconds": round(len(pcm) / 2.0 / 16000.0, 2),
+            "speaker": res.get("speaker"), "confidence": conf,
+            "margin": res.get("margin"), "is_new": res.get("is_new"),
+            "speaker_count": res.get("speaker_count"),
+            "emb": [round(float(x), 6) for x in emb] if emb is not None else None,
+        }
+        with open(os.path.join(outdir, "index.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(meta, ensure_ascii=False) + "\n")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -384,6 +426,7 @@ class Handler(BaseHTTPRequestHandler):
                 "calls": self.service.calls,
                 "errors": self.service.errors,
                 "sessions": len(self.service.sessions),
+                "save_audio": self.service.save_audio,
             })
             return
         self._json(404, {"error": "not found"})
@@ -430,6 +473,10 @@ def main() -> int:
                     default=int(os.environ.get("DIARIZE_MIN_MS", DEFAULT_MIN_MS)))
     ap.add_argument("--max-seconds", type=float, default=DEFAULT_MAX_SECONDS)
     ap.add_argument("--state-dir", default=os.environ.get("DIARIZE_STATE_DIR", ""))
+    ap.add_argument("--save-audio", action="store_true",
+                    default=os.environ.get("DIARIZE_SAVE_AUDIO", "").strip().lower()
+                    in ("1", "true", "yes", "on"),
+                    help="把每段音频与判定结果存到会话目录 audio/（调试用）")
     ap.add_argument("--mock", action="store_true", help="不用模型（联调用）")
     ap.add_argument("--no-preload", action="store_true", help="不在启动时加载模型")
     args = ap.parse_args()
@@ -467,11 +514,13 @@ def main() -> int:
         embedder = _Lazy()
 
     Handler.service = Service(embedder, args.threshold, args.min_ms,
-                              args.state_dir or None, args.state_dir or None)
+                              args.state_dir or None, args.state_dir or None,
+                              save_audio=args.save_audio)
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     srv.daemon_threads = True
     print(f"[diarize] 监听 http://{args.host}:{args.port}  "
-          f"(阈值 {args.threshold}，最短 {args.min_ms}ms；状态目录 {args.state_dir or '由主程序指定'})",
+          f"(阈值 {args.threshold}，最短 {args.min_ms}ms；状态目录 {args.state_dir or '由主程序指定'}"
+          + ("；音频留存=开" if args.save_audio else "") + ")",
           flush=True)
     try:
         srv.serve_forever()

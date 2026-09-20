@@ -489,8 +489,12 @@ func (rt *Runtime) DiarizeStatus() (string, map[string]any) {
 
 // ---- sidecar 自动拉起 ----
 
-// ensureSidecar 若 sidecar 不可达且配置允许，则拉起 tools/diarize/run.sh。
-// 首次运行该脚本会自动建 venv、装依赖、下模型（约 3~5 分钟），期间说话人标记自然缺失，
+// ensureSidecar 若 sidecar 不可达且配置允许，则拉起本机 sidecar。
+// 两种实现按优先级探测（HTTP 协议一致，主程序无需区分）：
+//  1. Go 版 tools/diarize-go/seat-diarize：自包含（sherpa-onnx 运行库 + CAM++ 模型
+//     与二进制同目录），启动仅 1~2s，容器镜像内即用它；
+//  2. Python 版 tools/diarize/run.sh：首次运行会建 venv、装依赖、下模型（约 3~5 分钟）。
+//
 // 就绪后无需重启主程序即可自动生效（每段都会重试连接）。
 func (rt *Runtime) ensureSidecar() {
 	s := rt.Settings
@@ -501,25 +505,43 @@ func (rt *Runtime) ensureSidecar() {
 	if err != nil || !isLoopback(host) {
 		return // 只自动拉起本机 sidecar；远端地址由部署方自行保证
 	}
-	script := filepath.Join(s.BaseDir, "tools", "diarize", "run.sh")
-	if _, err := os.Stat(script); err != nil {
-		log.Printf("[diarize] %s 不可达，且未找到 %s：说话人区分不可用"+
-			"（可手动 `bash tools/diarize/run.sh --port %s` 启动）", s.DiarizeURL, script, port)
-		return
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	_, err = rt.diarizer.Health(ctx)
 	cancel()
 	if err == nil {
+		return // 已在运行（无论哪个实现），不重复拉起
+	}
+
+	goDir := filepath.Join(s.BaseDir, "tools", "diarize-go")
+	goBin := filepath.Join(goDir, "seat-diarize")
+	script := filepath.Join(s.BaseDir, "tools", "diarize", "run.sh")
+
+	var cmd *exec.Cmd
+	desc := ""
+	if fi, statErr := os.Stat(goBin); statErr == nil && !fi.IsDir() {
+		cmd = exec.Command(goBin, "--port", port,
+			"--model", filepath.Join(goDir, "third_party", "models", "campplus.onnx"))
+		// cgo 的 rpath 指向「编译期源码路径」，换机器/装进镜像后失效；
+		// 用 LD_LIBRARY_PATH 指向随二进制分发的 sherpa-onnx 运行库兜底。
+		cmd.Env = append(os.Environ(), "LD_LIBRARY_PATH="+
+			filepath.Join(goDir, "third_party", "sherpa-onnx", "lib"))
+		desc = "Go 版 seat-diarize"
+	} else if fi, statErr := os.Stat(script); statErr == nil && !fi.IsDir() {
+		// 路径即 BASE_DIR 所在仓库，脚本用 bash 执行（无需可执行位）
+		cmd = exec.Command("bash", script, "--port", port)
+		cmd.Env = os.Environ()
+		desc = "Python 版 run.sh（首次运行会建 venv/装依赖/下模型，约 3~5 分钟）"
+	} else {
+		log.Printf("[diarize] %s 不可达，且未找到 %s 或 %s：说话人区分不可用"+
+			"（可手动 `./tools/diarize-go/seat-diarize --port %s` 或 `bash tools/diarize/run.sh --port %s` 启动）",
+			s.DiarizeURL, goBin, script, port, port)
 		return
 	}
+
 	logPath := filepath.Join(s.DataDirPath(), "diarize.log")
 	if err := mkdirAll(filepath.Dir(logPath)); err != nil {
 		log.Printf("[diarize] 创建日志目录失败: %v", err)
 	}
-	// 路径即 BASE_DIR 所在仓库，脚本用 bash 执行（无需可执行位）
-	cmd := exec.Command("bash", script, "--port", port)
-	cmd.Env = os.Environ()
 	if f, ferr := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); ferr == nil {
 		defer f.Close()
 		cmd.Stdout, cmd.Stderr = f, f
@@ -529,7 +551,7 @@ func (rt *Runtime) ensureSidecar() {
 		return
 	}
 	go func() { _ = cmd.Wait() }() // 回收子进程，避免僵尸
-	log.Printf("[diarize] 已拉起 CAM++ sidecar（首次运行会装依赖+下模型，日志：%s）", logPath)
+	log.Printf("[diarize] 已拉起 CAM++ sidecar（%s；日志：%s）", desc, logPath)
 }
 
 func splitURL(raw string) (host, port string, err error) {

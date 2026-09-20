@@ -22,8 +22,10 @@
 #     若需容器直连声卡：加 --device /dev/snd 并保证宿主机音频权限。
 #   - 镜像内附 mockasr（本地假 ASR 服务），可在无外网环境离线验证整条流水线：
 #       docker exec -it <容器> /app/mockasr -addr 127.0.0.1:18900
-#
-# 另：Python 版镜像保留在 Dockerfile.python（docker build -f Dockerfile.python .）
+#   - 说话人区分（CAM++）已内置为 **Go 版 sidecar**（seat-diarize：sherpa-onnx 推理，
+#     免 Python/torch，运行库与模型已打进镜像）。挂载的 .env 里 DIARIZE_ENABLED=true
+#     即启用：主程序会自动拉起 tools/diarize-go/seat-diarize 并连 127.0.0.1:18901
+#     （仅容器内使用，无需 EXPOSE）。
 
 # ---------- 构建阶段 ----------
 FROM golang:1.24-bookworm AS builder
@@ -49,6 +51,20 @@ RUN go build -trimpath -ldflags="-s -w" -o /out/seat . \
 # JIEBA_DICT_DIR 指过去。词典含 pos_dict 子目录（词性标注必需）。
 RUN cp -r "$(go env GOMODCACHE)"/github.com/yanyiwu/gojieba@*/deps/cppjieba/dict /out/jieba_dict
 
+# 说话人区分 sidecar（Go 版：sherpa-onnx C API + CAM++ 声纹模型，替代 Python 版）。
+# 只拷源码：开发机的 third_party/ 里可能是 macOS 预编译库（.dylib），而 fetch_deps.sh
+# 见到 include 头文件存在就会跳过下载 —— 必须让它在构建容器里干净地拉 Linux 版。
+COPY tools/diarize-go/go.mod tools/diarize-go/fetch_deps.sh /src/tools/diarize-go/
+COPY tools/diarize-go/*.go /src/tools/diarize-go/
+RUN apt-get update && apt-get install -y --no-install-recommends curl bzip2 \
+    && rm -rf /var/lib/apt/lists/* \
+    && cd /src/tools/diarize-go && bash ./fetch_deps.sh \
+    && go build -ldflags="-s -w" -o /out/seat-diarize . \
+    && mkdir -p /out/diarize/third_party/sherpa-onnx /out/diarize/third_party/models \
+    && cp -r third_party/sherpa-onnx/lib /out/diarize/third_party/sherpa-onnx/ \
+    && cp third_party/models/campplus.onnx /out/diarize/third_party/models/ \
+    && echo "[build] seat-diarize 动态依赖检查：" && (ldd /out/seat-diarize || true)
+
 # ---------- 运行阶段 ----------
 FROM debian:bookworm-slim
 
@@ -60,7 +76,7 @@ ENV TZ=Asia/Shanghai \
     JIEBA_DICT_DIR=/app/jieba_dict
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates tzdata libstdc++6 libasound2 \
+        ca-certificates tzdata libstdc++6 libasound2 libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -68,6 +84,10 @@ WORKDIR /app
 COPY --from=builder /out/seat /app/seat
 COPY --from=builder /out/mockasr /app/mockasr
 COPY --from=builder /out/jieba_dict /app/jieba_dict
+# 说话人区分 sidecar（Go 版，约 +50MB）：保持仓库目录布局，主程序按此路径探测
+# 并自动拉起（LD_LIBRARY_PATH 指向随包的 sherpa-onnx 运行库）
+COPY --from=builder /out/seat-diarize /app/tools/diarize-go/seat-diarize
+COPY --from=builder /out/diarize/third_party /app/tools/diarize-go/third_party
 COPY hotwords_dict.txt ./
 COPY .env.example ./
 

@@ -1,4 +1,5 @@
-// Package llm OpenAI 兼容 chat.completions 客户端（默认对接 taiji，模型 hy3）。
+// Package llm OpenAI 兼容 chat.completions 客户端（默认对接 taiji；模型与思考开关
+// 由配置 LLM_MODEL / LLM_REASONING_EFFORT 决定，如 hy4-preview + no_think）。
 // 对应 Python 版 app/providers/llm_openai.py。
 //
 // 超时语义与 Python 版对齐：httpx 的 timeout 是"单次操作"超时（连接/读），
@@ -36,17 +37,23 @@ type Message struct {
 
 // Client LLM 客户端。
 type Client struct {
-	url      string
-	apiKey   string
-	model    string
-	timeout  time.Duration
-	http     *http.Client
-	httpOnce *http.Client // 非流式复用同一 client
+	url    string
+	apiKey string
+	model  string
+	// reasoningEffort 透传到请求体 reasoning_effort 字段：空=不发送（模型默认，
+	// 思考模型会先思考）；"no_think"=关闭思考（hy 系列，需服务端支持该取值）。
+	// 思考阶段只流 reasoning_content 且被本客户端丢弃，首字要等思考结束（实测
+	// 10~30s）；关掉后正文 delta 直接开始流，首字秒级。
+	reasoningEffort string
+	timeout         time.Duration
+	http            *http.Client
+	httpOnce        *http.Client // 非流式复用同一 client
 }
 
 // New 创建客户端。chatPath 为空表示 baseURL 本身即完整端点（taiji）；
 // 标准 OpenAI 兼容服务填 "/v1/chat/completions"。
-func New(baseURL, apiKey, model string, timeout float64, chatPath string) *Client {
+// reasoningEffort 为空时请求体不发送 reasoning_effort 字段。
+func New(baseURL, apiKey, model string, timeout float64, chatPath, reasoningEffort string) *Client {
 	base := strings.TrimRight(baseURL, "/")
 	d := time.Duration(timeout * float64(time.Second))
 	if d <= 0 {
@@ -69,11 +76,12 @@ func New(baseURL, apiKey, model string, timeout float64, chatPath string) *Clien
 		IdleConnTimeout:       90 * time.Second,
 	}
 	return &Client{
-		url:     base + chatPath,
-		apiKey:  apiKey,
-		model:   model,
-		timeout: d,
-		http:    &http.Client{Transport: tr}, // 不设 Timeout：流式由 ctx 控制
+		url:             base + chatPath,
+		apiKey:          apiKey,
+		model:           model,
+		reasoningEffort: reasoningEffort,
+		timeout:         d,
+		http:            &http.Client{Transport: tr}, // 不设 Timeout：流式由 ctx 控制
 	}
 }
 
@@ -97,6 +105,9 @@ type chatRequest struct {
 	MaxTokens   int       `json:"max_tokens"`
 	Temperature float64   `json:"temperature"`
 	Stream      bool      `json:"stream"`
+	// ReasoningEffort 思考开关（"no_think" 关闭思考，hy 系列支持）；
+	// omitempty：留空时请求体不带该字段，保持对其它 OpenAI 兼容服务的兼容。
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 }
 
 type chatResponse struct {
@@ -127,6 +138,7 @@ func (c *Client) ChatTimeout(ctx context.Context, messages []Message, maxTokens 
 	payload := chatRequest{
 		Model: c.model, Messages: messages,
 		MaxTokens: maxTokens, Temperature: temperature, Stream: false,
+		ReasoningEffort: c.reasoningEffort,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -204,6 +216,7 @@ func (c *Client) StreamChat(
 	payload := chatRequest{
 		Model: c.model, Messages: messages,
 		MaxTokens: maxTokens, Temperature: temperature, Stream: true,
+		ReasoningEffort: c.reasoningEffort,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {

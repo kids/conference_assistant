@@ -27,7 +27,11 @@
   .seg{padding:6px 8px;border-radius:6px;font-size:14px;line-height:1.55;cursor:text}
   .seg.partial{color:var(--dim);font-style:italic}
   .seg.final{color:var(--txt);background:#22262e}
-  .seg .t{color:#5b6270;font-size:11px;margin-right:6px;font-family:monospace}
+  /* 句子行：句首时间戳。时间戳放在可编辑区（.seg）之外，与「说话人标记」同理 ——
+     人工改字提交的是 .seg 的 innerText，不会把时间戳带进转写文本。 */
+  .segline{display:flex;gap:7px;align-items:flex-start}
+  .segline .t{color:#5b6270;font-size:11px;font-family:monospace;flex:0 0 auto;padding-top:8px;user-select:none}
+  .segline .seg{flex:1;min-width:0}
   .seg.editing{outline:1px solid var(--accent)}
   /* 修正高亮：asr 回退纠错=黄，llm 顺句改写=蓝，1.5s 后淡出 */
   .seg.revised-asr{background:#3a3116;transition:background .6s}
@@ -87,6 +91,7 @@
   <h1>AI 跨学科实时翻译席 · 控制台</h1>
   <!-- 姓名/机构输入框已下线：热词改由「解析讲稿」生成（上传演示稿 → 抽词 + 摘要），不再依赖报告人信息 -->
   <label class="capcheck" title="勾选＝用浏览器麦克风采音，经 WebSocket 推给服务器识别（远端/服务器无声卡时用）；不勾选＝用服务器本机声卡。改动在下次点「开始 Session」时生效。"><input type="checkbox" id="capBrowser" checked>浏览器收音</label>
+  <label class="capcheck" title="浏览器收音的软件增益：默认 1（不处理）。实测默认 2× 会让峰值削波、反而伤识别；仅在页脚电平表显示轻声段低于 -45dB 时再调大（1.5~3 倍）。采集期间改动即时生效。"><input type="number" id="micGain" min="1" max="8" step="0.5" value="1" style="width:52px;background:#14161a;border:1px solid var(--line);color:var(--txt);border-radius:4px;padding:2px 4px;font-size:12px">倍增益</label>
   <button id="btnSession" class="primary">开始 Session</button>
   <button id="btnMicStop" class="danger" style="display:none" title="关闭浏览器麦克风采集（服务端流水线继续运行，可用「开始 Session」重新开启）">停止收音</button>
   <button id="btnKill" class="danger">急停 (Esc)</button>
@@ -172,6 +177,7 @@
   <span id="asrStatus">ASR: -</span>
   <span id="llmStatus">LLM: -</span>
   <span id="micStatus">收音: -</span>
+  <span id="micLevel"></span>
   <span id="spkStatus">说话人: -</span>
   <span id="sessionInfo">未开始</span>
   <span class="sp"></span>
@@ -185,6 +191,10 @@ const $=id=>document.getElementById(id);
 // 解析成 /api/x（前缀丢失），即使 Kong 配了 strip_path 也回不到后端。
 const BASE=location.pathname.replace(/\/(console|screen)\/?$/,"").replace(/\/+$/,"");
 let ws, sid=null, curInv=null, curTask=null, curText="", callCount=0;
+// 滚动跟随：仅当视口已在底部时才随新内容滚动 —— 操作员上翻查看历史时，
+// 新上屏的句子不会把人拽回底部；手动滚回底部后自动恢复跟随。
+let transcriptFollow=true, speechFollow=true;
+function atBottom(el){ return el.scrollHeight-el.scrollTop-el.clientHeight<30; }
 // 发言稿（右下角展示区）与 AI 输出卡是两条独立通道：分别记住各自的 invocation
 let speechInv=null, speechText="", speechReq=null;
 function escapeHtml(s){ return String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
@@ -207,7 +217,7 @@ function post(path,body){ return fetch(BASE+path,{method:"POST",headers:{"Conten
 function handle(m){
   switch(m.type){
     case "TRANSCRIPT_PARTIAL": draftSeg(m.text); break;
-    case "TRANSCRIPT_FINAL": finalSeg(m.seg_id,m.text); break;
+    case "TRANSCRIPT_FINAL": finalSeg(m.seg_id,m.text,m.t_start); break;
     case "TRANSCRIPT_REVISED": reviseSeg(m.seg_id,m.text,m.source); break;
     case "TERM_CANDIDATES": renderTerms(m.items); break;
     case "SPEAKER_ASSIGNED": markSpeaker(m.seg_id,m.speaker,m.label); loadSpeakers(); break;
@@ -232,7 +242,7 @@ function handle(m){
       }
       break;
     case "AI_DELTA":
-      if(m.invocation_id===speechInv){ speechText+=m.delta; $("speechCard").textContent=speechText; $("speechCard").scrollTop=$("speechCard").scrollHeight; }
+      if(m.invocation_id===speechInv){ speechText+=m.delta; $("speechCard").textContent=speechText; if(speechFollow) $("speechCard").scrollTop=$("speechCard").scrollHeight; }
       else if(m.invocation_id===curInv){ curText+=m.delta; $("aiCard").textContent=curText; }
       break;
     case "AI_READY":
@@ -285,25 +295,41 @@ function draftSeg(text){
   }
   if(!el){ el=document.createElement("div"); el.className="seg partial"; el.id="seg-draft"; $("transcript").appendChild(el); }
   el.textContent=text;
-  $("transcript").scrollTop=$("transcript").scrollHeight;
+  if(transcriptFollow) $("transcript").scrollTop=$("transcript").scrollHeight;
 }
-function finalSeg(id,text){
+function fmtClock(t){
+  // Unix 秒 → 本地墙钟 HH:MM:SS（便于与现场录音/会议记录对照）；无值返回空串
+  if(!t||!isFinite(t)) return "";
+  const d=new Date(t*1000), p=n=>String(n).padStart(2,"0");
+  return p(d.getHours())+":"+p(d.getMinutes())+":"+p(d.getSeconds());
+}
+function finalSeg(id,text,tStart){
   // 已确认终稿（黑色），每条独立，可点击修正。
-  // 外层 .segwrap 承载「说话人标记」（标记不参与编辑，避免人工改字时被写进转写）。
+  // 外层 .segwrap 承载「说话人标记」与「时间戳」（都不参与编辑，避免人工改字时被写进转写）。
   let wrap=document.getElementById("wrap-"+id);
   if(!wrap){
     wrap=document.createElement("div"); wrap.className="segwrap"; wrap.id="wrap-"+id;
     const tag=document.createElement("span"); tag.className="spk"; wrap.appendChild(tag);
-    const el=document.createElement("div"); el.className="seg final"; el.id="seg-"+id; el.contentEditable="true";
-    el.addEventListener("blur",()=>{ if(el.dataset.text!==el.innerText){ fetch(`${BASE}/api/segment/${id}`,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:el.innerText})}); el.dataset.text=el.innerText; }});
-    wrap.appendChild(el);
+    const line=document.createElement("div"); line.className="segline";
+    const ts=document.createElement("span"); ts.className="t"; ts.textContent=fmtClock(tStart);
+    const el=document.createElement("div"); el.className="seg final"; el.id="seg-"+id;
+    // 默认只读：可跨句自由拖选/复制（contentEditable 会把选择限制在单个编辑块内）；
+    // 双击进入编辑，失焦保存并退出编辑态。
+    el.contentEditable="false"; el.title="双击可修改";
+    el.addEventListener("dblclick",()=>{ el.contentEditable="true"; el.classList.add("editing"); el.focus(); });
+    el.addEventListener("blur",()=>{
+      el.contentEditable="false"; el.classList.remove("editing");
+      if(el.dataset.text!==el.innerText){ fetch(`${BASE}/api/segment/${id}`,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:el.innerText})}); el.dataset.text=el.innerText; }
+    });
+    line.appendChild(ts); line.appendChild(el);
+    wrap.appendChild(line);
     $("transcript").appendChild(wrap);
   }
   const el=document.getElementById("seg-"+id);
   el.dataset.text=text; el.textContent=text;
   // 终稿确认后清空草稿行
   const d=document.getElementById("seg-draft"); if(d) d.remove();
-  $("transcript").scrollTop=$("transcript").scrollHeight;
+  if(transcriptFollow) $("transcript").scrollTop=$("transcript").scrollHeight;
 }
 // ---- 说话人区分：把 CAM++ sidecar 判定的说话人标到对应句子上 ----
 // 换人时在上方画虚线分隔（「不同说话人 → 换行 + 标记」）；同人则去掉分隔，
@@ -504,7 +530,10 @@ setInterval(async()=>{ try{ const h=await fetch(BASE+"/api/health").then(r=>r.js
   }
 }catch(e){} },3000);
 // ---- 浏览器收音（远端：浏览器麦克风 → /ws/audio → 服务器 ASR）----
-let micOn=false, micCtx=null, micStream=null, micProc=null, micWs=null;
+let micOn=false, micCtx=null, micStream=null, micProc=null, micWs=null, micGain=null;
+let micPeak=0, micLevelAt=0;   // 电平表（增益前峰值，缓降显示）
+// 收音增益：默认 2 倍，现场可调（轻声/远场调大，削波失真调小）；采集期间改动即时生效
+function currentMicGain(){ const v=parseFloat(($("micGain")||{}).value); return (isFinite(v)&&v>0)?Math.min(8,Math.max(1,v)):1; }
 function downsample(buf,inRate,outRate){
   if(inRate===outRate) return buf;
   const ratio=inRate/outRate, n=Math.floor(buf.length/ratio), out=new Float32Array(n);
@@ -533,6 +562,9 @@ async function startMic(){
   try{ micCtx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:16000}); }
   catch(e){ micCtx=new (window.AudioContext||window.webkitAudioContext)(); }
   const src=micCtx.createMediaStreamSource(micStream);
+  // 软件增益：浏览器 AGC 对轻声/远场增益有限，NS 还可能把轻声当噪声压低 ——
+  // 电平不足时 ASR 会一直吐「嗯」。加一级可控增益，现场把轻声抬到 ASR 可用的电平。
+  micGain=micCtx.createGain(); micGain.gain.value=currentMicGain();
   micWs=new WebSocket((location.protocol==="https:"?"wss://":"ws://")+location.host+BASE+"/ws/audio");
   micWs.onclose=ev=>{ if(micOn){ if(ev.code===4001) $("sessionInfo").textContent="服务器流水线未开启浏览器收音：请勾选「浏览器收音」后重新点「开始 Session」"; stopMic(); } };
   const rate=micCtx.sampleRate;
@@ -540,12 +572,19 @@ async function startMic(){
   micProc.onaudioprocess=ev=>{
     if(!micWs||micWs.readyState!==1) return;
     let f32=ev.inputBuffer.getChannelData(0);
+    // 电平表（增益前，缓降）：把「麦克风收到了多少」变成可见数字 ——
+    // 轻声说话时若这里低于 -50dB，ASR 听不清多半是电平问题，调大增益即可。
+    let peak=0; for(let i=0;i<f32.length;i++){ const a=f32[i]<0?-f32[i]:f32[i]; if(a>peak) peak=a; }
+    micPeak=Math.max(micPeak*0.85,peak);
+    const nowMs=performance.now();
+    if(nowMs-micLevelAt>400){ micLevelAt=nowMs; const lv=$("micLevel");
+      if(lv) lv.textContent=micPeak>0.0001?("电平 "+(20*Math.log10(micPeak)).toFixed(0)+"dB"):"电平 静音"; }
     if(rate!==16000) f32=downsample(f32,rate,16000);
     const i16=new Int16Array(f32.length);
     for(let i=0;i<f32.length;i++){ const s=Math.max(-1,Math.min(1,f32[i])); i16[i]=s<0?s*0x8000:s*0x7FFF; }
     micWs.send(i16.buffer);
   };
-  src.connect(micProc);
+  src.connect(micGain); micGain.connect(micProc);
   const mute=micCtx.createGain(); mute.gain.value=0;  // ScriptProcessor 需连 destination 才运转；增益置 0 防外放回声
   micProc.connect(mute); mute.connect(micCtx.destination);
   micOn=true;
@@ -559,11 +598,14 @@ function stopMic(){
   try{ if(micProc) micProc.disconnect(); }catch(e){}
   try{ if(micCtx) micCtx.close(); }catch(e){}
   try{ if(micWs&&micWs.readyState===1) micWs.close(); }catch(e){}
-  micStream=null; micProc=null; micCtx=null; micWs=null;
+  micStream=null; micProc=null; micCtx=null; micWs=null; micGain=null;
+  micPeak=0;
   $("btnMicStop").style.display="none";
   $("micStatus").textContent="收音: 已停止";
+  $("micLevel").textContent="";
 }
 $("btnMicStop").onclick=stopMic;
+$("micGain").onchange=()=>{ if(micGain) micGain.gain.value=currentMicGain(); };   // 采集期间即时生效
 // ---- 热词面板：查看/手动编辑/按人生成/参与开关 ----
 async function loadHotwords(){
   try{ const h=await fetch(BASE+"/api/hotwords").then(r=>r.json());
@@ -630,6 +672,11 @@ if($("targetDiscipline")){
   $("targetDiscipline").onchange=applyTargetDiscipline;
   $("targetDiscipline").addEventListener("keydown",e=>{ if(e.key==="Enter"){ e.preventDefault(); applyTargetDiscipline(); } });
 }
+// 转写区/发言稿的自动跟随监听：上翻即暂停跟随，滚回底部自动恢复
+try{
+  $("transcript").addEventListener("scroll",()=>{ transcriptFollow=atBottom($("transcript")); });
+  $("speechCard").addEventListener("scroll",()=>{ speechFollow=atBottom($("speechCard")); });
+}catch(e){ console.error(e); }
 // 初始化：WS 已在文件开头建立；其余各自隔离，任一失败不影响其它
 try{ loadHotwords(); }catch(e){ console.error(e); }
 try{ loadTargetDiscipline(); }catch(e){ console.error(e); }

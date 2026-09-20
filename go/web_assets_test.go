@@ -35,7 +35,7 @@ func TestWebAssetsDOMRefsResolve(t *testing.T) {
 		required bool
 	}{
 		{"web", true},         // Go 版前端（//go:embed web）
-		{"../app/web", false}, // Python 版前端：仓库里还有它时一并守住
+		{"../app/web", false}, // 早期 Python 版前端（已移除；将来若恢复则一并守住）
 	}
 
 	checked := 0

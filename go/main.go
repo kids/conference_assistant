@@ -1,7 +1,7 @@
-// AI 跨学科实时翻译席 —— Go 实现。
+// AI 跨学科实时翻译席 —— Go 实现（仓库唯一实现）。
 //
-// 与 Python 版（app/）功能等价、HTTP/WebSocket 接口完全兼容，
-// 前端页面（web/console.html、web/screen.html）与 Python 版逐字相同，已内嵌进二进制。
+// 前端页面（web/console.html、web/screen.html）已内嵌进二进制。
+// 早期曾有一份功能等价的 Python 版（app/），已于 2026-09 移除（历史可查 git 提交）。
 //
 // 构建：
 //

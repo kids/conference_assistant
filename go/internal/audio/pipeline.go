@@ -34,6 +34,9 @@ type Pipeline struct {
 	spanFrom float64
 	spanBuf  []byte
 
+	// 会话录音留存（可选，排查用）：把收到的每帧连续写盘，见 Recorder。
+	rec *Recorder
+
 	preRoll [][]byte
 	stop    chan struct{}
 	done    chan struct{}
@@ -66,6 +69,10 @@ func (p *Pipeline) SetSpanSink(monitor *VadSegmenter, sink func(start, end float
 		p.monitor = monitor
 	}
 }
+
+// SetRecorder 启用会话录音留存（排查用）。Write 在流水线 goroutine 内调用：
+// 只做文件追加，写失败自动停用，不影响转写主链路。
+func (p *Pipeline) SetRecorder(r *Recorder) { p.rec = r }
 
 // Start 启动流水线 goroutine。
 func (p *Pipeline) Start() { go p.run() }
@@ -110,6 +117,9 @@ func (p *Pipeline) run() {
 		}
 	}()
 	defer func() {
+		if p.rec != nil {
+			p.rec.Close() // 回填 WAV 头，保证最后一片可播
+		}
 		p.asr.Close()
 		p.capture.Stop()
 	}()
@@ -134,6 +144,9 @@ func (p *Pipeline) run() {
 			continue
 		}
 		emptyRun = 0
+		if p.rec != nil {
+			p.rec.Write(frame)
+		}
 		p.ring.Push(frame)
 		p.pushPreRoll(frame)
 

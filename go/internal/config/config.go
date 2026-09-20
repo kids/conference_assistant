@@ -82,6 +82,13 @@ type Settings struct {
 	// 现场排查「编号乱跳 / 标记缺失」时打开：能直接看到某句话被配给了哪一段音频、为什么。
 	DiarizeDebug bool
 
+	// 会话录音留存（排查用）：把每场会议的原始音频连续写成 WAV 分片
+	// （sessions/<sid>/rec/），用于事后排查转写/说话人问题。
+	// 录音含会议内容，默认关闭；超期自动清理（RecKeepDays）。
+	RecEnabled    bool
+	RecSegmentSec int // 分片时长（秒）
+	RecKeepDays   int // 保留天数；0=不自动清理
+
 	// 发言（按立场生成发言稿）
 	// SpeechMaxTokens 「发言」单次生成预算。hy3 的思考与正文共享该预算，
 	// 2 分钟发言稿正文可达 600 字，预算过小会出现「正文为空」。
@@ -162,6 +169,10 @@ func Load() *Settings {
 		DiarizeMaxSegS:   envInt("DIARIZE_MAX_SEG_S", 6),
 		DiarizeAutostart: envBool("DIARIZE_AUTOSTART", true),
 		DiarizeDebug:     envBool("DIARIZE_DEBUG", false),
+
+		RecEnabled:    envBool("REC_ENABLED", false),
+		RecSegmentSec: envInt("REC_SEGMENT_SEC", 300),
+		RecKeepDays:   envInt("REC_KEEP_DAYS", 7),
 
 		SpeechMaxTokens: envInt("SPEECH_MAX_TOKENS", 6000),
 

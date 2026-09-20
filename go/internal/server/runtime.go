@@ -106,7 +106,17 @@ func NewRuntime(s *config.Settings) (*Runtime, error) {
 			s.DiarizeURL, s.DiarizeThreshold, s.DiarizeMinMS, s.DiarizeAutostart)
 		rt.startDiarize()
 	}
+	// 录音保留期清理：启动时清一次（新建会话时还会再清一次，见 CreateSession）
+	go sweepRecFiles(s.DataDirPath(), s.RecKeepDays)
 	return rt, nil
+}
+
+// sweepRecFiles 异步清理超保留期的录音文件（REC_KEEP_DAYS，0=不清理）。
+// 覆盖 sessions/<sid>/rec/*.wav（会话录音分片）与 sessions/<sid>/audio/*.wav（说话人段音频）。
+func sweepRecFiles(dataDir string, keepDays int) {
+	if n := audio.SweepRecFiles(dataDir, keepDays); n > 0 {
+		log.Printf("[rec] 已清理 %d 个超期录音文件（保留 %d 天）", n, keepDays)
+	}
 }
 
 // TargetDiscipline 当前目标学科。
@@ -422,6 +432,21 @@ func (rt *Runtime) StartPipeline(replayPath, captureMode string) (map[string]any
 
 	pipeline := audio.NewPipeline(capture, vad, asrClient, rt.ring, serverVAD)
 
+	// 会话录音留存（排查用，默认关闭）：连续写 sessions/<sid>/rec/*.wav。
+	// 挂点在流水线帧循环，浏览器收音与本机声卡两种音源都会被录到。
+	if s.RecEnabled {
+		if sid := rt.SessionID(); sid != "" {
+			recDir := filepath.Join(s.DataDirPath(), sid, "rec")
+			if rec, err := audio.NewRecorder(recDir, s.RecSegmentSec); err == nil {
+				pipeline.SetRecorder(rec)
+				log.Printf("[rec] 会话录音留存已开启：%s（每 %d 秒分片，保留 %d 天）",
+					recDir, s.RecSegmentSec, s.RecKeepDays)
+			} else {
+				log.Printf("[rec] 开启录音留存失败：%v", err)
+			}
+		}
+	}
+
 	// 说话人区分：需要「一次连续说话」的音频与边界。
 	// serverVAD 模式下本地 VAD 不参与断句，这里另建一个只做监测的 VAD
 	// （webrtcvad 开销约 0.08% 实时，不影响音频链路）。
@@ -544,6 +569,8 @@ func (rt *Runtime) CreateSession(title, speaker, institution, discipline string,
 	if err := mkdirAll(materialsDir); err != nil {
 		return nil, serverError("创建会话目录失败: %v", err)
 	}
+	// 新建会话时顺手清一遍超期录音（保留期见 REC_KEEP_DAYS）
+	go sweepRecFiles(rt.Settings.DataDirPath(), rt.Settings.RecKeepDays)
 
 	// 说话人区分：新 session 从零开始编号（sidecar 里若存着同 id 的旧状态也一并清掉）
 	rt.resetDiarize(sid)

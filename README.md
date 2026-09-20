@@ -234,9 +234,13 @@ curl -s http://127.0.0.1:8081/api/health
 | `DIARIZE_URL` | sidecar 地址，默认 `http://127.0.0.1:18901` |
 | `DIARIZE_THRESHOLD` | 同一说话人判定阈值（余弦，默认 0.5）：同人被拆开→调小，不同人并一起→调大 |
 | `DIARIZE_MIN_MS` | 过短的语音段不做判定（默认 600ms） |
+| `DIARIZE_MAX_SEG_S` | 说话人区分的音频段最长秒数（默认 6，与 ASR 的 `MAX_SEGMENT_S` 分开）：段越短、段内越可能只含一人；多人接话时 15s 段会把不同人并成一个编号 |
 | `DIARIZE_TIMEOUT` | 单段声纹判定超时（秒，默认 20） |
 | `DIARIZE_AUTOSTART` | sidecar 不可达时自动拉起（优先 Go 版 `tools/diarize-go/seat-diarize`，其次 Python 版 `tools/diarize/run.sh`；默认 true，仅本机 URL） |
 | `DIARIZE_DEBUG` | 打印每段语音的判定与配对决策（默认 false，排查编号乱跳时打开） |
+| `REC_ENABLED` | 会话录音留存（默认 false）：原始音频连续写成 WAV 分片 `sessions/<sid>/rec/`，供事后排查；录音含会议内容，开启前确认现场同意 |
+| `REC_SEGMENT_SEC` | 录音分片时长（秒，默认 300） |
+| `REC_KEEP_DAYS` | 录音保留天数（默认 7）：超期自动清理（服务启动时 + 新建会话时）；`0`=不清理。占用约 115MB/小时 |
 | `HOTWORDS_PATH` | 全局热词兜底（可留空，会前按科学家自动生成 session 专属热词） |
 
 ### 科学家热词自动生成

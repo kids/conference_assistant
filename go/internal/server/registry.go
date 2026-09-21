@@ -2,6 +2,7 @@ package server
 
 import (
 	"log"
+	"math"
 	"path/filepath"
 	"sync"
 	"time"
@@ -91,15 +92,29 @@ func (reg *Registry) Ensure(sid string) (*Runtime, error) {
 }
 
 // Create 新建会场：DB 记录 + 目录 + 独立 Runtime（尚未启动音频流水线，
-// 启动见 Runtime.initSession）。超上限返回 400。
+// 启动见 Runtime.initSession）。
+//
+// 已达上限时先尝试回收「没有活跃流水线且最久未访问」的会场（LRU）——
+// 打开 /console 的正常场景不会因历史会场堆积而失败；只有全部会场都在运行时才返回 400。
+// 被回收的会场只是从内存注册表移除（DB 记录与 sessions/<sid>/ 数据都保留），
+// 之后用 /<sid>/console 访问会按需恢复。
 func (reg *Registry) Create(title, speaker, institution, discipline string,
 	aiEnabled bool) (*Runtime, error) {
 	reg.mu.Lock()
 	if len(reg.sessions) >= reg.max {
+		victim := reg.pickVictimLocked()
+		if victim == nil {
+			reg.mu.Unlock()
+			return nil, badRequest("同时最多 %d 个会场且都在运行中；请先停止不用的会场", reg.max)
+		}
+		delete(reg.sessions, victim.SessionID())
+		reg.dropOrderLocked(victim.SessionID())
 		reg.mu.Unlock()
-		return nil, badRequest("同时最多 %d 个会场；请先结束不用的会场", reg.max)
+		log.Printf("[session] 会场数达上限 %d，已回收最久未访问的会场 %s", reg.max, victim.SessionID())
+		victim.close()
+	} else {
+		reg.mu.Unlock()
 	}
-	reg.mu.Unlock()
 
 	sid, err := reg.Store.CreateSession(title, speaker, discipline, aiEnabled, institution)
 	if err != nil {
@@ -196,5 +211,37 @@ func (reg *Registry) resetDiarize(sid string) {
 
 // newRuntime 构造一个会场运行时（共享 Store 与 diarizer）。
 func (reg *Registry) newRuntime(sid string) *Runtime {
-	return newSessionRuntime(reg.Settings, reg.Store, reg.diarizer, sid)
+	rt := newSessionRuntime(reg.Settings, reg.Store, reg.diarizer, sid)
+	rt.Touch()
+	return rt
+}
+
+// pickVictimLocked 选一个可回收的会场：没有活跃流水线、且最久未访问
+// （从未被访问过的优先）。调用方需持有 reg.mu。
+func (reg *Registry) pickVictimLocked() *Runtime {
+	var victim *Runtime
+	oldest := int64(math.MaxInt64)
+	for _, rt := range reg.sessions {
+		if rt.PipelineAlive() {
+			continue
+		}
+		t := rt.lastActive.Load()
+		if t == 0 {
+			t = 1 // 从未访问：最优先回收
+		}
+		if t < oldest {
+			oldest, victim = t, rt
+		}
+	}
+	return victim
+}
+
+// dropOrderLocked 从创建顺序里移除某会场。调用方需持有 reg.mu。
+func (reg *Registry) dropOrderLocked(sid string) {
+	for i, s := range reg.order {
+		if s == sid {
+			reg.order = append(reg.order[:i], reg.order[i+1:]...)
+			return
+		}
+	}
 }

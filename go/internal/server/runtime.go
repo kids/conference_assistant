@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"seat/internal/agent"
@@ -72,6 +73,10 @@ type Runtime struct {
 	spkStop  chan struct{}
 	spkOnce  sync.Once
 	spk      spkState
+
+	// lastActive 最近活跃序号（每个请求都会刷新，越大越近）：
+	// 会场数达上限时，Registry 优先回收「没有活跃流水线且序号最小」的会场。
+	lastActive atomic.Int64
 }
 
 // DefaultTargetDiscipline 默认目标学科。
@@ -179,6 +184,14 @@ func (rt *Runtime) SessionID() string {
 	defer rt.mu.Unlock()
 	return rt.sessionID
 }
+
+// activeSeq 全局活跃序号：每次会场被访问都自增，越大越近。
+// 用序号而不是时间戳做 LRU 比较：同一微秒内的多次访问在粗粒度时钟下会拿到
+// 相同时间戳，导致"谁更久未访问"判断失效（测试里实测踩到过）。
+var activeSeq atomic.Int64
+
+// Touch 刷新会场活跃序号（LRU 回收的依据）。
+func (rt *Runtime) Touch() { rt.lastActive.Store(activeSeq.Add(1)) }
 
 func (rt *Runtime) setSessionHotwords(words map[string]int) {
 	rt.mu.Lock()
@@ -393,7 +406,7 @@ func (rt *Runtime) StartPipeline(replayPath, captureMode string) (map[string]any
 		// 且服务端排队抖动时 ASR 需要更宽的容忍度（实测 0.8s~60s）。
 		client, err := asr.NewQwen3AsrHttpClient(s.Qwen3Backend, s.Qwen3Model, s.ASRLanguage,
 			hotwordList, s.ASRPartialInterval, s.VADSilenceMS, s.VADAggressiveness,
-			float64(s.MaxSegmentS), s.ASRInferTimeout, handlers)
+			float64(s.MaxSegmentS), s.ASRInferTimeout, s.Qwen3WarmupMS, handlers)
 		if err != nil {
 			return nil, err
 		}

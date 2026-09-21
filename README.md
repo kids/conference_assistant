@@ -219,6 +219,7 @@ curl -s http://127.0.0.1:8081/api/health
 | `QWEN3_BACKEND` | `qwen3_http` 的 HTTP 基址（如 `https://ml-serv.ssv.qq.com/s2`） |
 | `QWEN3_MODEL` | `qwen3_http` 模型名 |
 | `ASR_PARTIAL_INTERVAL` | `qwen3_http` 草稿重推周期（秒音频），调小更跟手、请求更频 |
+| `QWEN3_WARMUP_MS` | `qwen3_http` 启动冷静期（毫秒，默认 3000）：点开始后前 N 毫秒音频不送推理，丢弃采集启动瞬态（AGC 冲激等「类语音」环境声会被模型编成百科式幻觉）。检出真实说话起始自动提前结束；0=关闭 |
 | `HY_ASR_WS_URL` | `hy_stream` 端点 |
 | `HY_ASR_TOKEN` / `HY_ASR_MODEL` | `hy_stream` 鉴权与模型 |
 | `FUNASR_WS_URL` | 流式 WebSocket 端点；留空则按协议推导（`funasr_nano` 默认走 asr-gateway） |
@@ -263,7 +264,10 @@ curl -s http://127.0.0.1:8081/api/health
 
 - **`qwen3_http`**：vLLM OpenAI 兼容转写 `POST /v1/audio/transcriptions`（整段 WAV → 文本，单段 ≤30s）。
   WS 流式体验由客户端拼装：每 `ASR_PARTIAL_INTERVAL` 秒把累积缓冲整段重推一次出草稿，
-  webrtcvad 检测句尾静音后推理确认句；单段达 `MAX_SEGMENT_S` 强制切句；纯静音段不推理。
+  webrtcvad 检测句尾静音后推理确认句；单段达 `MAX_SEGMENT_S` 强制切句；纯静音段不推理；
+  启动冷静期（`QWEN3_WARMUP_MS`，默认 3s）：点开始后的采集启动瞬态（浏览器 AGC 冲激等
+  「类语音」环境声，webrtcvad 判其 99% 为语音、比真说话还高）不送推理 —— 否则模型会
+  编出百科式幻觉（实测 `"《小猫钓鱼》。"` / `"《小王子》是法国作家…"`，与电平无关）。
 - **`hy_stream`**：`asr-gateway /tencent/asr/recognize/stream`，逐词增量 + 语义 VAD 自动断句，支持服务端回退修正。
 - **`funasr_nano`**：Fun-ASR-Nano vLLM 服务，协议为 `START`/`LANGUAGE:中文`/`HOTWORDS:词1,词2`/`STOP` 文本命令 + 二进制 PCM（16k/mono/int16）。
   服务端自带动态 VAD 断句，客户端持续透传即可；本项目默认改用本地 VAD 主动切句以降低出字延迟。

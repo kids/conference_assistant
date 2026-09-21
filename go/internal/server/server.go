@@ -61,13 +61,20 @@ func New(reg *Registry, webFS fs.FS) *Server {
 // current 取本请求所属的会场：
 //   - 带 sid 的路由（/<sid>/...）由 withSession 解析后注入请求上下文；
 //   - 无 sid 的旧路由（兼容保留）回落到「当前会场」。
+//
+// 同时刷新会场的活跃时间（供 Registry 的 LRU 回收判断）。
 func (s *Server) current(r *http.Request) *Runtime {
 	if rt, ok := r.Context().Value(rtCtxKey{}).(*Runtime); ok && rt != nil {
+		rt.Touch()
 		return rt
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.cur
+	rt := s.cur
+	s.mu.Unlock()
+	if rt != nil {
+		rt.Touch()
+	}
+	return rt
 }
 
 // rtCtxKey 请求上下文里存放「本请求所属会场」的键。
@@ -130,6 +137,7 @@ func (s *Server) routes() *http.ServeMux {
 		method, path string
 		h            http.HandlerFunc
 	}{
+		{"POST", "/api/session", s.handleStartSessionCompat}, // 前端「开始 Session」：启动本会场流水线
 		{"POST", "/api/start", s.handleStartSession},
 		{"POST", "/api/stop", s.handleStopSession},
 		{"GET", "/api/export", s.handleExport},

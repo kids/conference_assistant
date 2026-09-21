@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"mime/multipart"
 	"net/http"
 	"runtime/debug"
@@ -26,7 +27,8 @@ import (
 //   - partial：每 partial_interval 秒音频，把自上一确认句起的累积缓冲整段重推一次，
 //     草稿单调增长（实测前缀稳定、词中截断自动修正，RTF 0.03~0.07）；
 //   - final：webrtcvad 检测句尾静音后推理确认句，清空缓冲；
-//   - 保护：单段达 max_segment_s 强制切句；纯静音段不推理（避免整段静音识别出「嗯。」）。
+//   - 保护：单段达 max_segment_s 强制切句；纯静音段不推理（避免整段静音识别出「嗯。」）；
+//     启动冷静期（见下方 warmup 常量）：丢弃采集启动瞬态的「类语音」环境声，避免静音幻觉。
 const (
 	qwenFrameMS    = 30
 	qwenSampleRate = 16000
@@ -38,6 +40,21 @@ const (
 	qwenInferAttempts = 2
 	// qwenRetryBackoff 重试前等待，给服务端一点排空时间。
 	qwenRetryBackoff = 400 * time.Millisecond
+
+	// 启动冷静期参数（总时长由配置 QWEN3_WARMUP_MS 控制，0=关闭）。
+	// 采集启动瞬间（浏览器 AGC 冲激、设备瞬态）会产生 2~5 秒的「类语音」环境声：
+	// 实测 webrtcvad 判其 99% 为语音（真实说话仅 83%，比真语音还像语音，故 VAD 门槛类
+	// 方案无效）；整段送推理则触发 LLM 式 ASR 的百科式幻觉（"《小王子》是法国作家…"，
+	// 同一段音频衰减 30dB 仍复现，与电平无关）。对策：启动后的前 warmupMS 毫秒音频
+	// 不进推理；一旦检出「真实说话起始」（显著高于环境基线的电平突增）立即提前结束。
+	// 判据经真实录音校准（浏览器采集实测：启动瞬态 -36~-42dBFS、稳定底噪 -50~-58、
+	// 真实说话元音 -30 以上；判据过松会在 0.8s 就把瞬态误判为说话起始，幻觉源漏过）。
+	qwenWarmupDeltaDB    = 12.0  // 说话起始判据：高于环境基线该幅度
+	qwenWarmupFloorDB    = -32.0 // 绝对下限：启动瞬态/底噪在 -35 以下，说话元音在 -30 以上
+	qwenWarmupRunFrames  = 5     // 连续超阈帧数（150ms），防偶发尖峰误触发
+	qwenWarmupBaseFrames = 10    // 环境基线有效帧数下限（300ms）
+	qwenWarmupValidDB    = -60.0 // 基线只统计高于该电平的帧（排除启动时的数字静音）
+	qwenWarmupPreBufMS   = 500   // 提前结束时保留的说话起点前上下文（避免切掉话头）
 )
 
 // inferHTTPError 非 200 响应。单独成类型是为了区分「值得重试」与「重试也没用」：
@@ -97,6 +114,16 @@ type Qwen3AsrHttpClient struct {
 	lastActive    time.Time
 	inferFail     int
 
+	// 启动冷静期状态（见 warmup 常量注释）。clock 可注入，测试用假时钟推进。
+	warmupMS    int
+	warmupUntil time.Time
+	warmupDone  bool
+	warmupBase  float64
+	warmupBaseN int
+	warmupRun   int
+	preBuf      []byte
+	clock       func() time.Time
+
 	vad  *webrtcvad.VAD
 	stop chan struct{}
 	done chan struct{}
@@ -104,9 +131,10 @@ type Qwen3AsrHttpClient struct {
 }
 
 // NewQwen3AsrHttpClient 创建客户端并启动调度协程。
+// warmupMS 为启动冷静期时长（0=关闭，见 warmup 常量注释）。
 func NewQwen3AsrHttpClient(baseURL, model, language string, hotwords []string,
 	partialIntervalS float64, vadSilenceMS, vadAggressiveness int, maxSegmentS, inferTimeoutS float64,
-	h Handlers) (*Qwen3AsrHttpClient, error) {
+	warmupMS int, h Handlers) (*Qwen3AsrHttpClient, error) {
 
 	v, err := webrtcvad.New()
 	if err != nil {
@@ -144,6 +172,8 @@ func NewQwen3AsrHttpClient(baseURL, model, language string, hotwords []string,
 		done:            make(chan struct{}),
 		wake:            make(chan struct{}, 1),
 		status:          "idle",
+		warmupMS:        warmupMS,
+		clock:           time.Now,
 	}
 	go c.scheduler()
 	return c, nil
@@ -180,11 +210,19 @@ func (c *Qwen3AsrHttpClient) SendAudio(pcm []byte) {
 	}
 }
 
-// feedFrame 累积音频并更新 VAD 状态机。
+// feedFrame 帧入口：冷静期内走 warmupFrame（丢弃采集启动瞬态），否则正常消费。
 func (c *Qwen3AsrHttpClient) feedFrame(frame []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.warmupActive() {
+		c.warmupFrame(frame)
+		return
+	}
+	c.consumeFrame(frame)
+}
 
+// consumeFrame 正常路径（持锁调用）：累积缓冲并更新 VAD 状态机。
+func (c *Qwen3AsrHttpClient) consumeFrame(frame []byte) {
 	c.buf = append(c.buf, frame...)
 	isSpeech := false
 	if ok, err := c.vad.Process(qwenSampleRate, frame); err == nil {
@@ -204,6 +242,87 @@ func (c *Qwen3AsrHttpClient) feedFrame(frame []byte) {
 	if c.inSpeech || c.speechFrames > 0 {
 		c.speechSeen = true
 	}
+}
+
+// warmupActive 是否处于启动冷静期（持锁调用）。懒启动：首帧到达时开始计时。
+// 超时未见说话起始 → 结束冷静期并丢弃期间收集的瞬态音频，当前帧起恢复正常处理。
+func (c *Qwen3AsrHttpClient) warmupActive() bool {
+	if c.warmupMS <= 0 || c.warmupDone {
+		return false
+	}
+	now := c.clock()
+	if c.warmupUntil.IsZero() {
+		c.warmupUntil = now.Add(time.Duration(c.warmupMS) * time.Millisecond)
+		log.Printf("[asr] qwen3 启动冷静期 %dms：丢弃采集启动瞬态（AGC 冲激等环境声会诱发静音幻觉）", c.warmupMS)
+	}
+	if !now.Before(c.warmupUntil) {
+		c.warmupDone = true
+		c.preBuf = nil
+		log.Printf("[asr] qwen3 冷静期结束：未检出说话起始，启动瞬态音频已丢弃")
+		return false
+	}
+	return true
+}
+
+// warmupFrame 冷静期内的帧处理：估计环境电平基线；检出真实说话起始则提前结束
+// 冷静期，并把起点前 qwenWarmupPreBufMS 的上下文一并交出（避免切掉话头）。
+func (c *Qwen3AsrHttpClient) warmupFrame(frame []byte) {
+	db := frameDBFS(frame)
+	if c.warmupBaseN < qwenWarmupBaseFrames {
+		// 基线只统计有效帧：采集刚启动时可能是数字静音/极低电平（实测 -90dBFS 以下），
+		// 若计入会把基线拉到 -75 之类，使相对判据失效。
+		if db > qwenWarmupValidDB {
+			c.warmupBase += (db - c.warmupBase) / float64(c.warmupBaseN+1)
+			c.warmupBaseN++
+		}
+		c.preBufAppend(frame)
+		return
+	}
+	if db > c.warmupBase+qwenWarmupDeltaDB && db > qwenWarmupFloorDB {
+		c.warmupRun++
+	} else {
+		c.warmupRun = 0
+	}
+	if c.warmupRun < qwenWarmupRunFrames {
+		c.preBufAppend(frame)
+		return
+	}
+	c.warmupDone = true
+	log.Printf("[asr] qwen3 冷静期检出说话起始，提前结束（保留起点前 %dms 上下文）",
+		len(c.preBuf)*1000/(qwenSampleRate*2))
+	pend := c.preBuf
+	c.preBuf = nil
+	for i := 0; i+qwenFrameBytes <= len(pend); i += qwenFrameBytes {
+		c.consumeFrame(pend[i : i+qwenFrameBytes])
+	}
+	c.consumeFrame(frame)
+}
+
+// preBufAppend 冷静期内滚动保留最近 qwenWarmupPreBufMS 的音频。
+func (c *Qwen3AsrHttpClient) preBufAppend(frame []byte) {
+	c.preBuf = append(c.preBuf, frame...)
+	max := qwenWarmupPreBufMS * qwenSampleRate * 2 / 1000
+	if len(c.preBuf) > max {
+		c.preBuf = append(c.preBuf[:0], c.preBuf[len(c.preBuf)-max:]...)
+	}
+}
+
+// frameDBFS 30ms 帧的 RMS 电平（dBFS，满量程 0dB）。
+func frameDBFS(frame []byte) float64 {
+	n := len(frame) / 2
+	if n == 0 {
+		return -120
+	}
+	var sum float64
+	for i := 0; i < n; i++ {
+		s := float64(int16(binary.LittleEndian.Uint16(frame[i*2:])))
+		sum += s * s
+	}
+	rms := math.Sqrt(sum / float64(n))
+	if rms < 1 {
+		return -120
+	}
+	return 20 * math.Log10(rms/32768)
 }
 
 // MarkEnd 外部要求立即切句。

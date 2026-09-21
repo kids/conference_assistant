@@ -13,7 +13,7 @@ import (
 func newInferTestClient(t *testing.T, baseURL string) *Qwen3AsrHttpClient {
 	t.Helper()
 	c, err := NewQwen3AsrHttpClient(baseURL, "qwen3asr17b", "中文", nil,
-		1.0, 600, 2, 15, 2.0, Handlers{})
+		1.0, 600, 2, 15, 2.0, 0, Handlers{}) // 0=关闭冷静期，测试直接调 infer
 	if err != nil {
 		t.Fatalf("构造客户端失败: %v", err)
 	}

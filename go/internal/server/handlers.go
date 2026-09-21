@@ -114,6 +114,32 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, res)
 }
 
+// handleStartSessionCompat 兼容前端「开始 Session」的调用形状：POST /<sid>/api/session。
+// 会场已由 URL 确定，这里只启动它的音频流水线；响应保持与会话创建接口相同的形状
+// （{session_id, pipeline, ...}），前端无需区分「新建会场」与「启动本会场」。
+func (s *Server) handleStartSessionCompat(w http.ResponseWriter, r *http.Request) {
+	rt := s.current(r)
+	var body sessionIn
+	_ = decodeBody(r, &body)
+	body.withDefaults()
+
+	// 目标学科作用于本会场（未传则不动）；非法值不阻断开会
+	if body.TargetDiscipline != "" {
+		_, _ = rt.SetTargetDiscipline(body.TargetDiscipline)
+	}
+	res, err := rt.StartPipeline("", body.Capture)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{
+		"session_id": rt.SessionID(),
+		"pipeline":   res,
+		"hotwords":   nil,
+		"profile":    "",
+	})
+}
+
 func (s *Server) handleStartSession(w http.ResponseWriter, r *http.Request) {
 	sid := r.PathValue("sid")
 	var body sessionIn

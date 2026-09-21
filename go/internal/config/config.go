@@ -26,8 +26,12 @@ type Settings struct {
 	HyASRToken string
 	HyASRModel string
 
-	Qwen3Backend       string
-	Qwen3Model         string
+	Qwen3Backend string
+	Qwen3Model   string
+	// Qwen3WarmupMS qwen3_http 启动冷静期（毫秒）：丢弃采集启动瞬态的「类语音」环境声
+	// （浏览器 AGC 冲激等，实测会诱发百科式幻觉，如"《小王子》是…"；与电平无关）。
+	// 检出真实说话起始会自动提前结束；0=关闭。
+	Qwen3WarmupMS      int
 	ASRPartialInterval float64
 	// ASRInferTimeout qwen3_http 单次推理超时（秒）。
 	// 与 LLMTimeout 分开：LLM 生成与 ASR 转写的合理超时不同，且服务端偶发排队时
@@ -132,6 +136,7 @@ func Load() *Settings {
 
 		Qwen3Backend:       envStr("QWEN3_BACKEND", "https://asr.example.com/s2"),
 		Qwen3Model:         envStr("QWEN3_MODEL", "qwen3asr17b"),
+		Qwen3WarmupMS:      envInt("QWEN3_WARMUP_MS", 3000),
 		ASRPartialInterval: envFloat("ASR_PARTIAL_INTERVAL", 1.0),
 		ASRInferTimeout:    envFloat("ASR_INFER_TIMEOUT", 60.0),
 

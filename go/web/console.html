@@ -222,7 +222,16 @@ function connect(){
 // 立即建连：函数声明已提升，handle 等在收到消息时（下一个事件循环）才被调用，此时脚本早已执行完。
 // 放在这里而不是脚本末尾 —— 后面任何一处事件绑定抛错都不该连带掐断转写通道。
 connect();
-function post(path,body){ return fetch(BASE+path,{method:"POST",headers:{"Content-Type":"application/json"},body:body?JSON.stringify(body):"{}"}).then(r=>r.json()); }
+// POST JSON 并解析响应。响应不是 JSON（例如路由没匹配上时 Go 返回的纯文本「404 page not found」）
+// 必须报出「HTTP 状态 + 原文片段」：直接 r.json() 的话，解析器的原文报错完全看不出原因
+// （"404 page not found" 里的 404 会被当成 JSON 数字，报 "Unexpected non-whitespace character
+// after JSON at position 4"，看着像服务没启动，实际是请求路径没有对应路由）。
+async function post(path,body){
+  const r=await fetch(BASE+path,{method:"POST",headers:{"Content-Type":"application/json"},body:body?JSON.stringify(body):"{}"});
+  const t=await r.text();
+  try{ return JSON.parse(t); }
+  catch(e){ throw new Error("HTTP "+r.status+" 非 JSON 响应："+(t.slice(0,200).replace(/\s+/g," ").trim()||"(空)")); }
+}
 
 function handle(m){
   switch(m.type){

@@ -41,6 +41,66 @@ type Client interface {
 	Close()
 }
 
+// LanguageAuto 归一化后的「自动检测」值：不向服务端指定语种，由模型自行判定。
+//
+// 为什么把 auto 做成一等公民：Qwen3-ASR / Fun-ASR 这类 LLM 式 ASR 在被强指定语种时，
+// 会把另一种语言的语音硬解码成该语言 —— 英文报告被「空耳」成中文、个别句子甚至被
+// 整句翻译成中文（现场「英文报告变中文」即此现象）。Qwen3-ASR 官方模型卡：
+// language=None → 自动语种识别（30 语种 + 22 种中文方言，1.7B 语种识别准确率 97.9%）。
+// 实测线上服务：不传 language 时中英文均正常，传 language=zh 时英文在干净音频上尚可，
+// 但复杂现场（远场、口音、串音）会被中文先验带偏。
+const LanguageAuto = "auto"
+
+// LanguageSetter 支持运行期切换语种的可选接口。
+// qwen3_http（下一次推理现取语种）与 funasr_nano（下一句重开会话时下发）已实现；
+// hy_stream / funasr 协议不带语种参数，未实现 —— 切换将在下次开始 Session 时生效。
+type LanguageSetter interface {
+	SetLanguage(language string)
+}
+
+// languageAliases 语种别名 → 项目内规范值（中文名）。各协议再转成自己要的写法：
+// qwen3_http 只认 ISO 码（zh/en/…），funasr_nano 认中文词（中文/英文/…）。
+var languageAliases = map[string]string{
+	"auto": LanguageAuto, "自动": LanguageAuto, "自动识别": LanguageAuto, "自动检测": LanguageAuto,
+	"zh": "中文", "中文": "中文", "汉语": "中文", "普通话": "中文", "chinese": "中文",
+	"en": "英文", "英文": "英文", "英语": "英文", "english": "英文",
+	"ja": "日语", "日语": "日语", "日文": "日语", "japanese": "日语",
+	"ko": "韩语", "韩语": "韩语", "韩文": "韩语", "korean": "韩语",
+}
+
+// knownLanguages 规范语种集合（运行期切换的白名单，防止误输入被拼进请求）。
+var knownLanguages = map[string]struct{}{"中文": {}, "英文": {}, "日语": {}, "韩语": {}}
+
+// NormalizeLanguage 归一化语种配置：空/auto/自动 → LanguageAuto；已知别名 → 中文/英文/…；
+// 未知值原样返回（由各协议自行转换或回退）。
+func NormalizeLanguage(raw string) string {
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return LanguageAuto
+	}
+	if canon, ok := languageAliases[strings.ToLower(v)]; ok {
+		return canon
+	}
+	return v
+}
+
+// KnownLanguage 是否为已知语种（含 LanguageAuto）。
+func KnownLanguage(language string) bool {
+	if language == LanguageAuto {
+		return true
+	}
+	_, ok := knownLanguages[language]
+	return ok
+}
+
+// languageLabel 语种的可读标签（内部空串即「自动」，日志/页面统一显示 auto）。
+func languageLabel(language string) string {
+	if language == "" {
+		return LanguageAuto
+	}
+	return language
+}
+
 // normalizeStatus 把原始状态串映射为稳定状态机（对齐 Python 版 _status）。
 // strict 为 true 时（qwen3_http），error 分支保留完整原始串作为 detail。
 func normalizeStatus(raw string) (state, detail string) {

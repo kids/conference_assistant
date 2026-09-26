@@ -376,7 +376,7 @@ metric(session_id, k, v, at)          -- 延迟、失败率等
 | 需求条款 | 实现 |
 |---|---|
 | 会前告知与可关闭 | `session.ai_enabled=false` 时系统只做转写不生成不展示；大屏显示"本场未启用 AI" |
-| 原始音频不长期保存 | 默认仅内存 RingBuffer；`KEEP_AUDIO=true` 才落盘到 `sessions/<id>/audio/`，并写入保留期限，`tools/purge.py` 到期删除 |
+| 原始音频不长期保存 | 默认仅内存 RingBuffer；排查用录音需显式开启：整场连续录音 `REC_SESSION_ENABLED=true` → `sessions/<id>/rec/`，说话人判定段 `DIARIZE_SAVE_SEGMENT_AUDIO=true` → `sessions/<id>/audio/`；两者均按 `REC_KEEP_DAYS` 到期自动清理（实现见 `audio.SweepRecFiles`） |
 | 输出不自动成纪要 | 导出包默认只含 `confirmation.verdict != null` 的条目；未确认条目单独标注"未确认，不得引用" |
 | 未发表数据处理 | 全部 Provider endpoint 可配为内网/本地；启动时打印"当前数据出网范围"清单并要求确认 |
 | 公开展示标注 | 大屏固定角标 + AI 输出模板强制确认句 |

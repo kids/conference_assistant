@@ -91,6 +91,7 @@
   footer{height:34px;display:flex;align-items:center;gap:14px;padding:0 16px;border-top:1px solid var(--line);font-size:12px;color:var(--dim);flex:0 0 auto}
   .capcheck{display:flex;align-items:center;gap:5px;font-size:12px;color:var(--dim);cursor:pointer;white-space:nowrap}
   .capcheck input{cursor:pointer}
+  .capcheck select{background:#14161a;border:1px solid var(--line);color:var(--txt);border-radius:4px;padding:2px 4px;font-size:12px;cursor:pointer}
 </style>
 </head>
 <body>
@@ -101,6 +102,11 @@
   <!-- 姓名/机构输入框已下线：热词改由「解析讲稿」生成（上传演示稿 → 抽词 + 摘要），不再依赖报告人信息 -->
   <label class="capcheck" title="勾选＝用浏览器麦克风采音，经 WebSocket 推给服务器识别（远端/服务器无声卡时用）；不勾选＝用服务器本机声卡。改动在下次点「开始 Session」时生效。"><input type="checkbox" id="capBrowser" checked>浏览器收音</label>
   <label class="capcheck" title="浏览器收音的软件增益：默认 1（不处理）。实测默认 2× 会让峰值削波、反而伤识别；仅在页脚电平表显示轻声段低于 -45dB 时再调大（1.5~3 倍）。采集期间改动即时生效。"><input type="number" id="micGain" min="1" max="8" step="0.5" value="1" style="width:52px;background:#14161a;border:1px solid var(--line);color:var(--txt);border-radius:4px;padding:2px 4px;font-size:12px">倍增益</label>
+  <label class="capcheck" title="ASR 识别语种：自动＝不下发语种，由模型逐句检测（中英混杂/英文报告推荐）；中文/English＝强制按该语种解码。qwen3_http 下一次识别即生效。注意：强制「中文」时英文报告会被硬解码成中文（空耳）甚至翻译成中文。"><select id="asrLang">
+    <option value="auto">自动</option>
+    <option value="中文">中文</option>
+    <option value="英文">English</option>
+  </select>语种</label>
   <button id="btnSession" class="primary">开始 Session</button>
   <button id="btnMicStop" class="danger" style="display:none" title="关闭浏览器麦克风采集（服务端流水线继续运行，可用「开始 Session」重新开启）">停止收音</button>
   <button id="btnKill" class="danger">急停 (Esc)</button>
@@ -694,6 +700,29 @@ if($("targetDiscipline")){
   $("targetDiscipline").onchange=applyTargetDiscipline;
   $("targetDiscipline").addEventListener("keydown",e=>{ if(e.key==="Enter"){ e.preventDefault(); applyTargetDiscipline(); } });
 }
+// ---- ASR 语种：自动＝不下发语种、由模型逐句检测（中英混杂/英文报告推荐）；纯语种场可强制 ----
+// 强制单一语种时，另一种语言的语音会被硬解码成该语种（英文报告空耳成中文/被翻译），
+// 因此默认「自动」，只在整场都是同一语种时才建议强制。
+async function loadASRLanguage(){
+  const el=$("asrLang"); if(!el) return;
+  try{ const r=await fetch(BASE+"/api/asr-language").then(r=>r.json());
+    if(!r||!r.language) return;
+    // .env 里配了下拉框没有的语种（如日语）时补一个选项，否则 select.value 赋不上值，
+    // 界面会显示成「自动」而实际是别的语种 —— 这类不一致在现场最难排查
+    if(![...el.options].some(o=>o.value===r.language)){
+      const o=document.createElement("option"); o.value=r.language; o.textContent=r.language; el.appendChild(o);
+    }
+    el.value=r.language;
+  }catch(e){}
+}
+async function applyASRLanguage(){
+  const el=$("asrLang"); if(!el) return;
+  const r=await post("/api/asr-language",{language:el.value}).catch(()=>null);
+  if(!r||!r.ok){ $("sessionInfo").textContent="语种未生效"+((r&&r.error)?("："+r.error):""); return; }
+  const label=(r.language==="auto")?"自动":r.language;
+  $("sessionInfo").textContent="ASR 语种："+label+(r.live?"（已生效，下一次识别起）":"（下次开始 Session 生效）");
+}
+if($("asrLang")){ $("asrLang").onchange=applyASRLanguage; }
 // 转写区/发言稿的自动跟随监听：上翻即暂停跟随，滚回底部自动恢复
 try{
   $("transcript").addEventListener("scroll",()=>{ transcriptFollow=atBottom($("transcript")); });
@@ -721,6 +750,7 @@ try{
 // 初始化：WS 已在文件开头建立；其余各自隔离，任一失败不影响其它
 try{ loadHotwords(); }catch(e){ console.error(e); }
 try{ loadTargetDiscipline(); }catch(e){ console.error(e); }
+try{ loadASRLanguage(); }catch(e){ console.error(e); }
 try{ loadSpeechOptions(); }catch(e){ console.error(e); }
 </script>
 </body>

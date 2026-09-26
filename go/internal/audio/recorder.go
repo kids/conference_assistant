@@ -18,7 +18,7 @@ import (
 // 按 VAD/段长强切、不含静音，且依赖说话人区分开启；排查 ASR 问题需要连续、
 // 完整（含静音上下文）的录音。
 //
-// 隐私：录音含会议内容，默认关闭（REC_ENABLED=1 开启），保留期默认 7 天
+// 隐私：录音含会议内容，默认关闭（REC_SESSION_ENABLED=1 开启），保留期默认 7 天
 // （REC_KEEP_DAYS，0=不清理）。写失败静默停用，绝不影响转写主链路。
 type Recorder struct {
 	dir        string

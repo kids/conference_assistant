@@ -65,6 +65,11 @@ type Runtime struct {
 	// 目标学科：把 AI 输出调整到该学科的表达层次。默认「白话」=非专业听众也能听懂。
 	// 与 session.discipline（报告人学科，仅用于热词生成）是两个不同概念。
 	targetDiscipline string
+	// asrLanguage ASR 语种（规范值：auto/中文/英文/…；auto = 不指定语种，由模型检测）。
+	// 会场级：初值取自 .env 的 ASR_LANGUAGE，可在控制台运行期切换（见 SetASRLanguage）。
+	// 为什么需要它：LLM 式 ASR 被强指定语种时，另一种语言的报告会被硬解码成该语种
+	// —— 英文报告「空耳」成中文、个别句子被翻译成中文；auto 交给模型逐句判定。
+	asrLanguage string
 
 	// 说话人区分（CAM++ sidecar）：diarizer 为 nil 表示未启用。
 	// spkCh/spkStop 由 startDiarize 懒创建；spk 见 diarize.go。
@@ -102,6 +107,7 @@ func newSessionRuntime(s *config.Settings, st *store.Store, dz *diarize.Client, 
 		hotwordsEnabled:  true,
 		roundSegs:        map[string]string{},
 		targetDiscipline: DefaultTargetDiscipline,
+		asrLanguage:      asr.NormalizeLanguage(s.ASRLanguage),
 		diarizer:         dz,
 	}
 	// 恢复已有会场的会话级热词（sessions/<sid>/hotwords.txt；新会场不存在即跳过）
@@ -164,6 +170,40 @@ func (rt *Runtime) SetTargetDiscipline(v string) (string, error) {
 	rt.targetDiscipline = v
 	rt.mu.Unlock()
 	return v, nil
+}
+
+// ASRLanguage 当前 ASR 语种（规范值：auto/中文/英文/…）。
+func (rt *Runtime) ASRLanguage() string {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if rt.asrLanguage == "" {
+		return asr.LanguageAuto
+	}
+	return rt.asrLanguage
+}
+
+// SetASRLanguage 切换 ASR 语种，返回规范值与「是否已对运行中的 ASR 即时生效」。
+// qwen3_http 下一次推理即生效；funasr_nano 下一句生效；hy_stream / funasr 协议不带
+// 语种参数（live=false），下次开始 Session 时才用得上。未开始 Session 时只记录。
+func (rt *Runtime) SetASRLanguage(v string) (string, bool, error) {
+	lang := asr.NormalizeLanguage(v)
+	// 白名单：已知语种或 2 字母 ISO 码才放行，防止误输入被原样塞进请求
+	if !asr.KnownLanguage(lang) && len([]rune(lang)) != 2 {
+		return rt.ASRLanguage(), false, fmt.Errorf("未知语种 %q（可选：自动/中文/英文/日语/韩语）", v)
+	}
+	rt.mu.Lock()
+	rt.asrLanguage = lang
+	client := rt.asrClient
+	rt.mu.Unlock()
+	if client == nil {
+		return lang, false, nil
+	}
+	setter, ok := client.(asr.LanguageSetter)
+	if !ok {
+		return lang, false, nil
+	}
+	setter.SetLanguage(lang)
+	return lang, true, nil
 }
 
 // Close 释放本会场资源（停流水线、停说话人工作协程）。
@@ -386,6 +426,9 @@ func (rt *Runtime) StartPipeline(replayPath, captureMode string) (map[string]any
 	handlers := rt.makeHandlers()
 	hotwords := rt.activeHotwords()
 	hotwordList := asr.HotwordList(hotwords)
+	// 会场级语种（可在控制台运行期切换），而非直接读 .env —— 英文报告场切到「英文」
+	// 或「自动」，不必改配置重启
+	lang := rt.ASRLanguage()
 
 	var (
 		asrClient asr.Client
@@ -397,19 +440,22 @@ func (rt *Runtime) StartPipeline(replayPath, captureMode string) (map[string]any
 		asrClient = asr.NewHyAsrStreamClient(s.HyASRWSURL, s.HyASRToken, s.HyASRModel, hotwordList, handlers)
 		serverVAD = true
 	case "funasr_nano":
-		asrClient = asr.NewFunAsrNanoStreamClient(s.WSURL(), s.ASRLanguage, hotwordList, handlers)
+		asrClient = asr.NewFunAsrNanoStreamClient(s.WSURL(), lang, hotwordList, handlers)
 		// 服务端 VAD 断句过粗（实测 10~20s 才出一句），默认改用本地 VAD 主动切句：
 		// 句尾静音即发 STOP 让服务端立刻 flush，出字延迟降到约 0.8s
 		serverVAD = !s.LocalVADSegment
 	case "qwen3_http":
 		// 推理超时用 ASRInferTimeout 而非 LLMTimeout：两者合理值不同，
 		// 且服务端排队抖动时 ASR 需要更宽的容忍度（实测 0.8s~60s）。
-		client, err := asr.NewQwen3AsrHttpClient(s.Qwen3Backend, s.Qwen3Model, s.ASRLanguage,
+		client, err := asr.NewQwen3AsrHttpClient(s.Qwen3Backend, s.Qwen3Model, lang,
 			hotwordList, s.ASRPartialInterval, s.VADSilenceMS, s.VADAggressiveness,
 			float64(s.MaxSegmentS), s.ASRInferTimeout, s.Qwen3WarmupMS, handlers)
 		if err != nil {
 			return nil, err
 		}
+		// QWEN3_TOKEN：配置里填了就带 Authorization: Bearer（服务端开 --api-key 时必需），
+		// 空值不发头。此前这项只在 .env.example 里有、代码未接通
+		client.SetToken(s.Qwen3Token)
 		asrClient = client
 		serverVAD = true // 持续透传，切句由客户端自管
 	default:
@@ -469,13 +515,13 @@ func (rt *Runtime) StartPipeline(replayPath, captureMode string) (map[string]any
 
 	// 会话录音留存（排查用，默认关闭）：连续写 sessions/<sid>/rec/*.wav。
 	// 挂点在流水线帧循环，浏览器收音与本机声卡两种音源都会被录到。
-	if s.RecEnabled {
+	if s.RecSessionEnabled {
 		if sid := rt.SessionID(); sid != "" {
 			recDir := filepath.Join(s.DataDirPath(), sid, "rec")
-			if rec, err := audio.NewRecorder(recDir, s.RecSegmentSec); err == nil {
+			if rec, err := audio.NewRecorder(recDir, s.RecChunkSec); err == nil {
 				pipeline.SetRecorder(rec)
 				log.Printf("[rec] 会话录音留存已开启：%s（每 %d 秒分片，保留 %d 天）",
-					recDir, s.RecSegmentSec, s.RecKeepDays)
+					recDir, s.RecChunkSec, s.RecKeepDays)
 			} else {
 				log.Printf("[rec] 开启录音留存失败：%v", err)
 			}

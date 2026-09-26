@@ -17,7 +17,7 @@ func testSettings(dir string) *config.Settings {
 		MaxSegmentS:       15,
 		DiarizeMaxSegS:    6,
 		RecKeepDays:       7,
-		RecSegmentSec:     300,
+		RecChunkSec:       300,
 		RefineEnabled:     false,
 		RefineMinChars:    12,
 	}

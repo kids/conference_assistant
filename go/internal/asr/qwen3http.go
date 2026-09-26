@@ -80,15 +80,34 @@ func retryableInferErr(err error) bool {
 	return true
 }
 
-// langMap 语言别名 → ISO 639-1（vLLM transcriptions 仅接受 ISO 码）。
-var langMap = map[string]string{
-	"中文": "zh", "汉语": "zh", "英语": "en", "英文": "en", "日语": "ja", "韩语": "ko",
+// qwen3ISOMap 规范语种 → ISO 639-1（vLLM transcriptions 仅接受 ISO 码，发「中文」会 400）。
+var qwen3ISOMap = map[string]string{
+	"中文": "zh", "英文": "en", "日语": "ja", "韩语": "ko",
+}
+
+// qwen3LanguageField 规范语种 → 请求里的 language 字段值。
+// 返回空串表示「不发送该字段」：服务端（Qwen3-ASR）据此做自动语种检测 ——
+// 一旦带上 language，模型就被强制按该语种解码，英文报告在复杂现场条件下会被
+// 硬解码成中文（空耳）甚至翻译成中文，这正是本次问题的根因。
+func qwen3LanguageField(language string) string {
+	if language == "" || language == LanguageAuto {
+		return ""
+	}
+	if iso, ok := qwen3ISOMap[language]; ok {
+		return iso
+	}
+	if len([]rune(language)) == 2 { // 已是 ISO 码（zh/en/ja…）
+		return language
+	}
+	log.Printf("[asr] qwen3 未识别的语种 %q，回退 zh；可选：自动/中文/英文/日语/韩语 或 ISO 码", language)
+	return "zh"
 }
 
 // Qwen3AsrHttpClient Qwen3-ASR HTTP 转写客户端（模拟流式）。
 type Qwen3AsrHttpClient struct {
 	baseURL         string
 	model           string
+	token           string // 服务端 --api-key 鉴权（空=不发 Authorization 头）
 	language        string
 	partialInterval float64
 	vadSilenceMS    int
@@ -147,19 +166,10 @@ func NewQwen3AsrHttpClient(baseURL, model, language string, hotwords []string,
 		return nil, err
 	}
 
-	lang := strings.TrimSpace(strings.ToLower(language))
-	iso, ok := langMap[lang]
-	if !ok {
-		iso = "zh"
-		if len([]rune(language)) == 2 {
-			iso = language
-		}
-	}
-
 	c := &Qwen3AsrHttpClient{
 		baseURL:         strings.TrimRight(baseURL, "/"),
 		model:           model,
-		language:        iso,
+		language:        qwen3LanguageField(NormalizeLanguage(language)),
 		partialInterval: partialIntervalS,
 		vadSilenceMS:    vadSilenceMS,
 		maxSegmentS:     maxSegmentS,
@@ -343,6 +353,25 @@ func (c *Qwen3AsrHttpClient) UpdateHotwords(words map[string]int) {
 	c.mu.Unlock()
 }
 
+// SetToken 设置服务端鉴权密钥（QWEN3_TOKEN，对应 vLLM 的 --api-key）。
+// 空串 = 不发 Authorization 头；inferOnce 每次现取，下一次推理即生效。
+func (c *Qwen3AsrHttpClient) SetToken(token string) {
+	c.mu.Lock()
+	c.token = strings.TrimSpace(token)
+	c.mu.Unlock()
+}
+
+// SetLanguage 运行期切换语种（规范值或别名：自动/中文/英文/…；自动 = 不发送 language
+// 字段，由服务端自动检测）。inferOnce 每次都现取语种，下一次推理即生效。
+func (c *Qwen3AsrHttpClient) SetLanguage(language string) {
+	field := qwen3LanguageField(NormalizeLanguage(language))
+	c.mu.Lock()
+	prev := c.language
+	c.language = field
+	c.mu.Unlock()
+	log.Printf("[asr] qwen3 语种切换：%s → %s（下一次推理生效）", languageLabel(prev), languageLabel(field))
+}
+
 // StatusInfo 当前状态。
 func (c *Qwen3AsrHttpClient) StatusInfo() StatusInfo {
 	c.mu.Lock()
@@ -444,7 +473,7 @@ func (c *Qwen3AsrHttpClient) infer(pcm []byte) string {
 // inferOnce 单次推理尝试；err 非空表示这次尝试失败（含 HTTP 非 200）。
 func (c *Qwen3AsrHttpClient) inferOnce(pcm []byte) (string, error) {
 	c.mu.Lock()
-	model, language := c.model, c.language
+	model, language, token := c.model, c.language, c.token
 	hotwords := append([]string(nil), c.hotwords...)
 	c.mu.Unlock()
 
@@ -458,7 +487,10 @@ func (c *Qwen3AsrHttpClient) inferOnce(pcm []byte) (string, error) {
 		return "", err
 	}
 	_ = mw.WriteField("model", model)
-	_ = mw.WriteField("language", language)
+	// 语种为空 = 不下发该字段，由服务端自动检测（见 qwen3LanguageField 注释）
+	if language != "" {
+		_ = mw.WriteField("language", language)
+	}
 	if len(hotwords) > 0 {
 		_ = mw.WriteField("hotwords", strings.Join(hotwords, ","))
 	}
@@ -474,6 +506,10 @@ func (c *Qwen3AsrHttpClient) inferOnce(pcm []byte) (string, error) {
 		return "", err
 	}
 	req.Header.Set("Content-Type", mw.FormDataContentType())
+	// QWEN3_TOKEN：服务端开启 --api-key 时才需要；空值不发头（与 hy 的 token 语义一致）
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {

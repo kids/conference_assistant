@@ -3,6 +3,7 @@
 package config
 
 import (
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -28,6 +29,10 @@ type Settings struct {
 
 	Qwen3Backend string
 	Qwen3Model   string
+	// Qwen3Token qwen3asr 服务端鉴权密钥（Authorization: Bearer）。服务端未开 --api-key
+	// 时留空即可（客户端不发该头）。.env.example 里一直有这项，但此前 Go 版未接通 ——
+	// 属于「配置写了却不生效」，与「写死」同样是配置失真，现已真正生效。
+	Qwen3Token string
 	// Qwen3WarmupMS qwen3_http 启动冷静期（毫秒）：丢弃采集启动瞬态的「类语音」环境声
 	// （浏览器 AGC 冲激等，实测会诱发百科式幻觉，如"《小王子》是…"；与电平无关）。
 	// 检出真实说话起始会自动提前结束；0=关闭。
@@ -38,7 +43,12 @@ type Settings struct {
 	// ASR 需要更宽的容忍度（实测同一段音频延迟在 0.8s~60s 间波动）。
 	ASRInferTimeout float64
 
-	ASRChunkSize    string
+	ASRChunkSize string
+	// ASRLanguage ASR 语种（qwen3_http / funasr_nano）：auto/自动 = 不指定语种，
+	// 由模型逐句自动检测（默认）；也可强制 中文/英文/日语/韩语 或 ISO 码。
+	// 默认 auto 的原因：LLM 式 ASR 被强指定语种时，另一语种的报告会被硬解码成
+	// 该语种 —— 英文报告「空耳」成中文、个别句子被翻译成中文；中文语音在 auto 下
+	// 同样能正确识别。运行期可在控制台顶部「语种」下拉框切换（见 Runtime.SetASRLanguage）。
 	ASRLanguage     string
 	HotwordsPath    string
 	LocalVADSegment bool
@@ -85,13 +95,20 @@ type Settings struct {
 	// DiarizeDebug 打印「每段语音的判定结果」与「句子-语音段的配对决策」。
 	// 现场排查「编号乱跳 / 标记缺失」时打开：能直接看到某句话被配给了哪一段音频、为什么。
 	DiarizeDebug bool
+	// DiarizeSaveSegmentAudio 把「说话人判定用的语音段」及其判定结果（index.jsonl，含
+	// embedding）落盘到 sessions/<sid>/audio/（调试用：离线重算相似度矩阵、定量验证阈值）。
+	// 与 RecSessionEnabled 的区别：那是连续完整录音（含静音），这里是按 VAD/段长强切出的段。
+	// 默认关闭。此前它只存在于 sidecar 自己的环境变量里、主程序从不透传（.env 里写了无效），
+	// 现改为真正的配置项并由主程序传给 sidecar。
+	DiarizeSaveSegmentAudio bool
 
-	// 会话录音留存（排查用）：把每场会议的原始音频连续写成 WAV 分片
-	// （sessions/<sid>/rec/），用于事后排查转写/说话人问题。
-	// 录音含会议内容，默认关闭；超期自动清理（RecKeepDays）。
-	RecEnabled    bool
-	RecSegmentSec int // 分片时长（秒）
-	RecKeepDays   int // 保留天数；0=不自动清理
+	// 会话录音留存（排查用）：把每场会议的原始音频**连续**写成 WAV 分片
+	// （sessions/<sid>/rec/），含静音上下文，用于事后回放「当时收音到底什么样」。
+	// 与 DiarizeSaveSegmentAudio（只存「判定用的语音段」）是两种不同材料，命名上
+	// 用 SESSION / SEGMENT 区分。录音含会议内容，默认关闭；超期自动清理（RecKeepDays）。
+	RecSessionEnabled bool
+	RecChunkSec       int // 分片时长（秒）—— 文件分片，不是说话人判定段
+	RecKeepDays       int // 保留天数；0=不自动清理
 
 	// 发言（按立场生成发言稿）
 	// SpeechMaxTokens 「发言」单次生成预算。hy3 的思考与正文共享该预算，
@@ -106,8 +123,8 @@ type Settings struct {
 	MaxSegmentS       int
 
 	// 数据与开关
-	DataDir      string
-	KeepAudio    bool
+	DataDir string
+	// WakewordAuto 预留：唤醒词自动触发（当前无实现）
 	WakewordAuto bool
 	LogLevel     string
 
@@ -136,12 +153,13 @@ func Load() *Settings {
 
 		Qwen3Backend:       envStr("QWEN3_BACKEND", "https://asr.example.com/s2"),
 		Qwen3Model:         envStr("QWEN3_MODEL", "qwen3asr17b"),
+		Qwen3Token:         envStr("QWEN3_TOKEN", ""),
 		Qwen3WarmupMS:      envInt("QWEN3_WARMUP_MS", 3000),
 		ASRPartialInterval: envFloat("ASR_PARTIAL_INTERVAL", 1.0),
 		ASRInferTimeout:    envFloat("ASR_INFER_TIMEOUT", 60.0),
 
 		ASRChunkSize:    envStr("ASR_CHUNK_SIZE", "5,10,5"),
-		ASRLanguage:     envStr("ASR_LANGUAGE", "中文"),
+		ASRLanguage:     envStr("ASR_LANGUAGE", "auto"),
 		HotwordsPath:    envStr("HOTWORDS_PATH", "hotwords_dict.txt"),
 		LocalVADSegment: envBool("LOCAL_VAD_SEGMENT", true),
 
@@ -174,10 +192,12 @@ func Load() *Settings {
 		DiarizeMaxSegS:   envInt("DIARIZE_MAX_SEG_S", 6),
 		DiarizeAutostart: envBool("DIARIZE_AUTOSTART", true),
 		DiarizeDebug:     envBool("DIARIZE_DEBUG", false),
+		// 旧名 DIARIZE_SAVE_AUDIO 兼容（此前主程序并不读它，只有 sidecar 自己看环境变量）
+		DiarizeSaveSegmentAudio: envBoolRenamed("DIARIZE_SAVE_SEGMENT_AUDIO", "DIARIZE_SAVE_AUDIO", false),
 
-		RecEnabled:    envBool("REC_ENABLED", false),
-		RecSegmentSec: envInt("REC_SEGMENT_SEC", 300),
-		RecKeepDays:   envInt("REC_KEEP_DAYS", 7),
+		RecSessionEnabled: envBoolRenamed("REC_SESSION_ENABLED", "REC_ENABLED", false),
+		RecChunkSec:       envIntRenamed("REC_CHUNK_SEC", "REC_SEGMENT_SEC", 300),
+		RecKeepDays:       envInt("REC_KEEP_DAYS", 7),
 
 		SpeechMaxTokens: envInt("SPEECH_MAX_TOKENS", 6000),
 
@@ -188,7 +208,6 @@ func Load() *Settings {
 		MaxSegmentS:       envInt("MAX_SEGMENT_S", 15),
 
 		DataDir:      envStr("DATA_DIR", "sessions"),
-		KeepAudio:    envBool("KEEP_AUDIO", false),
 		WakewordAuto: envBool("WAKEWORD_AUTO", false),
 		LogLevel:     envStr("LOG_LEVEL", "info"),
 
@@ -311,11 +330,47 @@ func envFloat(key string, def float64) float64 {
 
 func envBool(key string, def bool) bool {
 	if v, ok := os.LookupEnv(key); ok {
-		switch strings.ToLower(strings.TrimSpace(v)) {
-		case "1", "true", "yes", "on":
-			return true
-		case "0", "false", "no", "off":
-			return false
+		return parseBool(v, def)
+	}
+	return def
+}
+
+func parseBool(v string, def bool) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	}
+	return def
+}
+
+// ---- 改名兼容层 ----
+// env*Renamed 优先读新键名，旧键名仍兼容（命中旧名时提示改名）。
+// 存在的意义：环境变量改名后，旧的 .env / 容器 ENV 不会报错，只会静默回落到默认值 ——
+// 「功能突然不生效了」最难查。宁可打一行日志让人看见，也不要悄悄降级。
+
+func envBoolRenamed(newKey, oldKey string, def bool) bool {
+	if v, ok := os.LookupEnv(newKey); ok && strings.TrimSpace(v) != "" {
+		return parseBool(v, def)
+	}
+	if v, ok := os.LookupEnv(oldKey); ok && strings.TrimSpace(v) != "" {
+		log.Printf("[config] %s 已更名为 %s（当前仍在用旧名，请更新 .env）", oldKey, newKey)
+		return parseBool(v, def)
+	}
+	return def
+}
+
+func envIntRenamed(newKey, oldKey string, def int) int {
+	if v, ok := os.LookupEnv(newKey); ok && strings.TrimSpace(v) != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			return n
+		}
+	}
+	if v, ok := os.LookupEnv(oldKey); ok && strings.TrimSpace(v) != "" {
+		log.Printf("[config] %s 已更名为 %s（当前仍在用旧名，请更新 .env）", oldKey, newKey)
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			return n
 		}
 	}
 	return def

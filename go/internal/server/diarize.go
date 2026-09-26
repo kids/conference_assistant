@@ -519,8 +519,14 @@ func (rt *Runtime) ensureSidecar() {
 	var cmd *exec.Cmd
 	desc := ""
 	if fi, statErr := os.Stat(goBin); statErr == nil && !fi.IsDir() {
-		cmd = exec.Command(goBin, "--port", port,
-			"--model", filepath.Join(goDir, "third_party", "models", "campplus.onnx"))
+		args := []string{"--port", port,
+			"--model", filepath.Join(goDir, "third_party", "models", "campplus.onnx")}
+		// 段音频落盘（DIARIZE_SAVE_SEGMENT_AUDIO）：必须由主程序显式传参 ——
+		// .env 的值不会导出到进程环境，sidecar 自己读环境变量是读不到的
+		if s.DiarizeSaveSegmentAudio {
+			args = append(args, "--save-audio")
+		}
+		cmd = exec.Command(goBin, args...)
 		// cgo 的 rpath 指向「编译期源码路径」，换机器/装进镜像后失效；
 		// 用 LD_LIBRARY_PATH 指向随二进制分发的 sherpa-onnx 运行库兜底。
 		cmd.Env = append(os.Environ(), "LD_LIBRARY_PATH="+
@@ -530,6 +536,9 @@ func (rt *Runtime) ensureSidecar() {
 		// 路径即 BASE_DIR 所在仓库，脚本用 bash 执行（无需可执行位）
 		cmd = exec.Command("bash", script, "--port", port)
 		cmd.Env = os.Environ()
+		if s.DiarizeSaveSegmentAudio {
+			cmd.Env = append(cmd.Env, "DIARIZE_SAVE_AUDIO=1") // Python 版从环境变量读
+		}
 		desc = "Python 版 run.sh（首次运行会建 venv/装依赖/下模型，约 3~5 分钟）"
 	} else {
 		log.Printf("[diarize] %s 不可达，且未找到 %s 或 %s：说话人区分不可用"+
@@ -551,7 +560,8 @@ func (rt *Runtime) ensureSidecar() {
 		return
 	}
 	go func() { _ = cmd.Wait() }() // 回收子进程，避免僵尸
-	log.Printf("[diarize] 已拉起 CAM++ sidecar（%s；日志：%s）", desc, logPath)
+	log.Printf("[diarize] 已拉起 CAM++ sidecar（%s；段音频落盘 %v；日志：%s）",
+		desc, s.DiarizeSaveSegmentAudio, logPath)
 }
 
 func splitURL(raw string) (host, port string, err error) {

@@ -3,6 +3,7 @@ package asr
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 
@@ -38,10 +39,19 @@ var quietEvents = map[string]struct{}{
 	"event:started": {}, "event:stopped": {}, "event:language_set": {}, "event:hotwords_set": {},
 }
 
+// nanoLanguage 规范语种 → LANGUAGE 命令的值（funasr_nano 认中文词：中文/英文/日语/韩语）。
+// 返回空串表示不发 LANGUAGE 命令，由服务端自动检测语种。
+func nanoLanguage(language string) string {
+	if language == "" || language == LanguageAuto {
+		return ""
+	}
+	return language
+}
+
 // NewFunAsrNanoStreamClient 创建客户端。
 func NewFunAsrNanoStreamClient(url, language string, hotwords []string, h Handlers) *FunAsrNanoStreamClient {
 	c := &FunAsrNanoStreamClient{
-		language: language,
+		language: nanoLanguage(NormalizeLanguage(language)),
 		hotwords: append([]string(nil), hotwords...),
 		handlers: h,
 		status:   "idle",
@@ -126,6 +136,23 @@ func (c *FunAsrNanoStreamClient) UpdateHotwords(words map[string]int) {
 	c.started = false
 	c.mu.Unlock()
 	c.conn.disconnect()
+}
+
+// SetLanguage 切换语种（自动 = 不发 LANGUAGE 命令）。语种在每轮会话 START 时下发：
+// 本地 VAD 逐句切句时下一句自然生效；当前若正处在会话中则断开重连（与热词同一策略），
+// 避免剩下的半句沿用旧语种。
+func (c *FunAsrNanoStreamClient) SetLanguage(language string) {
+	lang := nanoLanguage(NormalizeLanguage(language))
+	c.mu.Lock()
+	prev := c.language
+	c.language = lang
+	started := c.started
+	c.started = false
+	c.mu.Unlock()
+	if started {
+		c.conn.disconnect()
+	}
+	log.Printf("[asr] funasr_nano 语种切换：%s → %s（下一句生效）", languageLabel(prev), languageLabel(lang))
 }
 
 func (c *FunAsrNanoStreamClient) onStatus(raw string) {

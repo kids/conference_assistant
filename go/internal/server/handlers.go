@@ -40,6 +40,10 @@ type targetDisciplineIn struct {
 	Discipline string `json:"discipline"`
 }
 
+type asrLanguageIn struct {
+	Language string `json:"language"`
+}
+
 func (b *sessionIn) withDefaults() {
 	if b.Title == "" {
 		b.Title = "Workshop"
@@ -610,6 +614,26 @@ func (s *Server) handleSetTargetDiscipline(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, 200, map[string]any{"ok": true, "discipline": v})
 }
 
+// handleGetASRLanguage 当前 ASR 语种（页面加载时回填下拉框）。
+func (s *Server) handleGetASRLanguage(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]any{"language": s.current(r).ASRLanguage()})
+}
+
+// handleSetASRLanguage 切换 ASR 语种（qwen3_http 下一次识别即生效，无需重启 session）。
+func (s *Server) handleSetASRLanguage(w http.ResponseWriter, r *http.Request) {
+	var body asrLanguageIn
+	if err := decodeBody(r, &body); err != nil {
+		writeJSON(w, 400, map[string]any{"error": "请求体解析失败: " + err.Error()})
+		return
+	}
+	lang, live, err := s.current(r).SetASRLanguage(body.Language)
+	if err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "language": lang, "live": live})
+}
+
 func (s *Server) handleShow(w http.ResponseWriter, r *http.Request) {
 	iid := r.PathValue("iid")
 	var body showIn
@@ -752,6 +776,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"llm":            llmStatus,
 		"llm_model":      st.LLMModel,
 		"protocol":       st.ASRProtocol,
+		// 当前生效的 ASR 语种（auto = 服务端自动检测）：现场排查「英文被识别成中文」时，
+		// 先看这里是不是被强制成了中文
+		"asr_language":   s.current(r).ASRLanguage(),
 		"asr_ws_url":     asrURL,
 		"capture":        s.current(r).CaptureMode(),
 		"mic":            micState,

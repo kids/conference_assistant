@@ -224,7 +224,7 @@ curl -s http://127.0.0.1:8081/api/health
 | `HY_ASR_TOKEN` / `HY_ASR_MODEL` | `hy_stream` 鉴权与模型 |
 | `FUNASR_WS_URL` | 流式 WebSocket 端点；留空则按协议推导（`funasr_nano` 默认走 asr-gateway） |
 | `FUNASR_SERV` | `funasr` 协议的 HTTP 基址 |
-| `ASR_LANGUAGE` | `funasr_nano` / `qwen3_http` 语种，默认 `中文` |
+| `ASR_LANGUAGE` | `funasr_nano` / `qwen3_http` 语种，默认 `auto`：不下发语种，由模型逐句自动检测。可强制 `中文`/`英文`/`日语`/`韩语`（或 ISO 码）。**强制「中文」时英文报告会被硬解码成中文（空耳）甚至翻译成中文**，中英混杂的会请用 `auto`。运行期可在控制台顶部「语种」下拉框切换（`qwen3_http` 下一次识别即生效） |
 | `LOCAL_VAD_SEGMENT` | `funasr_nano` 是否用本地 VAD 主动切句（句尾静音即发 STOP，出字更快）。关闭则退回服务端 VAD（实测 10~20s 才出一句） |
 | `LLM_BASE` | taiji LLM 端点（即完整端点，不再拼接 `/v1/chat/completions`） |
 | `LLM_KEY` | API Key |
@@ -242,9 +242,10 @@ curl -s http://127.0.0.1:8081/api/health
 | `DIARIZE_TIMEOUT` | 单段声纹判定超时（秒，默认 20） |
 | `DIARIZE_AUTOSTART` | sidecar 不可达时自动拉起（优先 Go 版 `tools/diarize-go/seat-diarize`，其次 Python 版 `tools/diarize/run.sh`；默认 true，仅本机 URL） |
 | `DIARIZE_DEBUG` | 打印每段语音的判定与配对决策（默认 false，排查编号乱跳时打开） |
-| `REC_ENABLED` | 会话录音留存（默认 false）：原始音频连续写成 WAV 分片 `sessions/<sid>/rec/`，供事后排查；录音含会议内容，开启前确认现场同意 |
-| `REC_SEGMENT_SEC` | 录音分片时长（秒，默认 300） |
-| `REC_KEEP_DAYS` | 录音保留天数（默认 7）：超期自动清理（服务启动时 + 新建会话时）；`0`=不清理。占用约 115MB/小时 |
+| `DIARIZE_SAVE_SEGMENT_AUDIO` | 把「说话人判定段」+ 判定结果 `index.jsonl` 落盘到 `sessions/<sid>/audio/`（默认 false）：离线重算相似度、验证阈值时打开 |
+| `REC_SESSION_ENABLED` | 会话录音留存（默认 false）：原始音频**连续**写成 WAV 分片 `sessions/<sid>/rec/`（含静音），供事后回放排查；录音含会议内容，开启前确认现场同意。与 `DIARIZE_SAVE_SEGMENT_AUDIO`（只存判定段）是两种材料 |
+| `REC_CHUNK_SEC` | 录音文件分片时长（秒，默认 300）—— 文件分片，与说话人判定段无关 |
+| `REC_KEEP_DAYS` | 录音保留天数（默认 7）：超期自动清理 `rec/` 与 `audio/`（服务启动时 + 新建会话时）；`0`=不清理。占用约 115MB/小时 |
 | `HOTWORDS_PATH` | 全局热词兜底（可留空，会前按科学家自动生成 session 专属热词） |
 
 ### 科学家热词自动生成
@@ -271,6 +272,11 @@ curl -s http://127.0.0.1:8081/api/health
 - **`hy_stream`**：`asr-gateway /tencent/asr/recognize/stream`，逐词增量 + 语义 VAD 自动断句，支持服务端回退修正。
 - **`funasr_nano`**：Fun-ASR-Nano vLLM 服务，协议为 `START`/`LANGUAGE:中文`/`HOTWORDS:词1,词2`/`STOP` 文本命令 + 二进制 PCM（16k/mono/int16）。
   服务端自带动态 VAD 断句，客户端持续透传即可；本项目默认改用本地 VAD 主动切句以降低出字延迟。
+- **语种（`ASR_LANGUAGE` / 控制台「语种」）**：默认 `auto` = 不下发语种，由模型自动检测
+  （Qwen3-ASR 官方：不指定语种即自动识别，30 语种 + 22 种中文方言）。**LLM 式 ASR 被强指定
+  单一语种时，另一语种的语音会被硬解码成该语种** —— 强制「中文」时英文报告会出现「空耳」
+  （英文读音被写成同音汉字）或整句被翻译成中文。注意：`qwen3_http` 的 `language` 参数只接受
+  ISO 码（`zh`/`en`），`funasr_nano` 的 `LANGUAGE:` 用中文词（`中文`/`英文`），由各客户端内部转换。
 - **`funasr`**：标准 FunASR WebSocket 2pass，协议为配置 JSON（`mode`/`chunk_size`/`is_speaking`）+ PCM 二进制帧，本地 VAD 控制断句。
 
 ## 快捷键（控制台）

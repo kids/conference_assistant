@@ -133,3 +133,112 @@ func TestInferLanguageMappedToISO(t *testing.T) {
 		t.Errorf("language 应被转换为 zh，实际发出 %q", got)
 	}
 }
+
+// TestInferAutoLanguageOmitsField：语种=自动时不得发送 language 字段。
+// 该字段一旦出现，服务端就会把解码语种强制定死 —— 英文报告在复杂现场条件下会被
+// 硬解码成中文（空耳）甚至翻译成中文，正是本次问题的根因；省略字段才走自动语种检测。
+func TestInferAutoLanguageOmitsField(t *testing.T) {
+	var (
+		has  bool
+		body string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseMultipartForm(1 << 20)
+		_, has = r.MultipartForm.Value["language"]
+		body = r.FormValue("language")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"text":"ok"}`))
+	}))
+	defer srv.Close()
+
+	c := newInferTestClient(t, srv.URL)
+	c.SetLanguage("自动")
+	c.infer(make([]byte, 16000*2))
+
+	if has {
+		t.Errorf("自动语种不应发送 language 字段（当前收到 %q）", body)
+	}
+}
+
+// TestInferSendsTokenWhenConfigured：QWEN3_TOKEN 填了就必须带 Authorization: Bearer
+// （服务端开 --api-key 时唯一凭据）；留空则绝不发该头 —— 配置项必须真的生效。
+func TestInferSendsTokenWhenConfigured(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"text":"ok"}`))
+	}))
+	defer srv.Close()
+
+	c := newInferTestClient(t, srv.URL)
+	c.infer(make([]byte, 16000*2))
+	if got != "" {
+		t.Fatalf("token 空时不应发送 Authorization，实际 %q", got)
+	}
+
+	c.SetToken("secret-key")
+	c.infer(make([]byte, 16000*2))
+	if got != "Bearer secret-key" {
+		t.Errorf("token 应作为 Bearer 头发送，实际 %q", got)
+	}
+}
+
+// TestSetLanguageAppliesNextInfer：运行期切语种，下一次推理即用新值（无需重建客户端）。
+func TestSetLanguageAppliesNextInfer(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseMultipartForm(1 << 20)
+		got = r.FormValue("language")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"text":"ok"}`))
+	}))
+	defer srv.Close()
+
+	c := newInferTestClient(t, srv.URL)
+	c.SetLanguage("英文")
+	c.infer(make([]byte, 16000*2))
+	if got != "en" {
+		t.Fatalf("切到英文后应发出 en，实际 %q", got)
+	}
+
+	c.SetLanguage("自动")
+	c.infer(make([]byte, 16000*2))
+	if got != "" {
+		t.Errorf("切回自动后不应发出 language 字段，实际 %q", got)
+	}
+}
+
+// TestNormalizeLanguage：别名归一化是语种配置的唯一入口，各协议据此再转写。
+func TestNormalizeLanguage(t *testing.T) {
+	cases := map[string]string{
+		"":        LanguageAuto,
+		"auto":    LanguageAuto,
+		"自动":      LanguageAuto,
+		"自动识别":    LanguageAuto,
+		" zh ":    "中文",
+		"中文":      "中文",
+		"汉语":      "中文",
+		"en":      "英文",
+		"英语":      "英文",
+		"English": "英文",
+		"ja":      "日语",
+		"ko":      "韩语",
+		"de":      "de", // 未收录的 ISO 码原样透传，由协议侧决定
+	}
+	for in, want := range cases {
+		if got := NormalizeLanguage(in); got != want {
+			t.Errorf("NormalizeLanguage(%q) = %q，期望 %q", in, got, want)
+		}
+	}
+	for _, known := range []string{LanguageAuto, "中文", "英文", "日语", "韩语"} {
+		if !KnownLanguage(known) {
+			t.Errorf("%q 应为已知语种", known)
+		}
+	}
+	for _, unknown := range []string{"", "乱七八糟", "zh"} {
+		if KnownLanguage(unknown) {
+			t.Errorf("%q 不应被判为已知语种", unknown)
+		}
+	}
+}

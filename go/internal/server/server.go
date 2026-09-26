@@ -149,6 +149,8 @@ func (s *Server) routes() *http.ServeMux {
 		{"GET", "/api/materials", s.handleListMaterials},
 		{"GET", "/api/target-discipline", s.handleGetTargetDiscipline},
 		{"POST", "/api/target-discipline", s.handleSetTargetDiscipline},
+		{"GET", "/api/asr-language", s.handleGetASRLanguage},
+		{"POST", "/api/asr-language", s.handleSetASRLanguage},
 		{"GET", "/api/devices", s.handleDevices},
 		{"GET", "/api/speech/options", s.handleSpeechOptions},
 		{"GET", "/api/speakers", s.handleSpeakers},
@@ -186,6 +188,8 @@ func (s *Server) routes() *http.ServeMux {
 	mux.HandleFunc("GET /api/materials", s.handleListMaterials)
 	mux.HandleFunc("GET /api/target-discipline", s.handleGetTargetDiscipline)
 	mux.HandleFunc("POST /api/target-discipline", s.handleSetTargetDiscipline)
+	mux.HandleFunc("GET /api/asr-language", s.handleGetASRLanguage)
+	mux.HandleFunc("POST /api/asr-language", s.handleSetASRLanguage)
 	mux.HandleFunc("GET /api/devices", s.handleDevices)
 	mux.HandleFunc("GET /api/speech/options", s.handleSpeechOptions)
 	mux.HandleFunc("GET /api/speakers", s.handleSpeakers)
